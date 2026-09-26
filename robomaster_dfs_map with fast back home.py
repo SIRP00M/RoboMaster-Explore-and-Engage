@@ -22,6 +22,12 @@ Behavior:
   - Persistent JSON + ASCII map is autosaved while exploring.
   - Saved maps can be replayed later without re-discovering topology.
   - Known-map mode can BFS to a requested goal cell.
+  - Node scans never perform IR lateral recovery; IR LOW at a node triggers
+    an immediate stationary Gimbal L/F/R topology scan instead.
+  - After the final frontier is scanned, DFS stops backtracking and uses the
+    confirmed completed map to take the fastest move+turn route back to (0,0).
+  - Mid-edge single-IR recovery failure no longer crashes immediately:
+    near-node -> accept; otherwise retreat to source cell and rescan/replan.
 
 IMPORTANT:
   Tune CELL_LENGTH_M and TOF_OPEN_THRESHOLD_MM for the real maze geometry.
@@ -30,6 +36,7 @@ IMPORTANT:
 
 from robomaster import robot
 import argparse
+import heapq
 import json
 import math
 import os
@@ -201,7 +208,8 @@ AUTHORITY_HARD_STRAFE_MPS = 0.13
 # BOTH-IR behavior.
 # When both digital IR sensors are LOW, do NOT slide randomly.
 # Stop and let the gimbal ToF scan LEFT / FRONT / RIGHT.
-IR_BOTH_ROUTE_OPEN_MM = 400.0
+# Keep the IR/Gimbal supervisor consistent with the DFS topology classifier.
+IR_BOTH_ROUTE_OPEN_MM = 600.0
 IR_BOTH_FRONT_OVERRIDE_SEC = 1.00
 
 # Forward motion.
@@ -238,7 +246,11 @@ CELL_SUCCESS_FRACTION = 0.82
 # > threshold  -> OPEN
 #
 # *** TUNE THIS FOR THE REAL MAZE ***
-TOF_OPEN_THRESHOLD_MM = 400
+# Maze cell pitch is 60 cm.
+# At a node, a wall belonging to the current cell should normally appear
+# much closer than one full grid pitch; an OPEN direction should see through
+# into the next cell.  Use 600 mm as the topology-open threshold.
+TOF_OPEN_THRESHOLD_MM = 600
 
 # Explicit dead-end safety override.
 # After the gimbal has measured LEFT / FRONT / RIGHT at a cell:
@@ -298,6 +310,32 @@ MAP_LATEST_ASCII = MAP_DIR / "latest_map.txt"
 # Save latest_map.json/.txt after every meaningful topology change.
 # This protects the learned map even if the run is interrupted later.
 MAP_AUTOSAVE = True
+
+# After the LAST unexplored frontier has been scanned, do NOT continue
+# unwinding the DFS parent stack all the way home.  Plan a direct return
+# through the completed map instead.
+FAST_RETURN_HOME_AFTER_DFS = True
+FAST_RETURN_MAX_REPLANS = 8
+
+# Estimated action times used only by the home-route planner.
+# They let the planner prefer a route that may have the same number of cells
+# but fewer costly 90/180-degree turns.
+FAST_RETURN_MOVE_EST_SEC = 4.0
+FAST_RETURN_TURN_90_EST_SEC = 3.0
+FAST_RETURN_TURN_180_EST_SEC = 5.0
+
+
+# ============================================================
+# TRANSIENT MOTION-ABORT RECOVERY
+# ============================================================
+# If a side-IR recovery cannot be cleared while the robot is still between
+# cells, do not crash the whole mission and do not permanently mark that edge
+# as a wall.  Back out along the just-traversed corridor, return close to the
+# source cell, then rescan/replan.
+MOTION_ABORT_RETREAT_SPEED_MPS = 0.10
+MOTION_ABORT_HOME_TOL_M = 0.055
+MOTION_ABORT_PROGRESS_EPS_M = 0.020
+MOTION_ABORT_TIMEOUT_SEC = 6.0
 
 
 # ============================================================
@@ -611,6 +649,13 @@ class DFSMazeExplorer:
         self.ir_both_front_override_until = 0.0
         self.ir_replan_requested = False
         self.ir_route_hint = None
+
+        # Distinguish a transient mid-edge safety abort from a confirmed wall.
+        # DFS uses this to rescan the SAME source cell instead of corrupting
+        # the map by permanently blocking the edge.
+        self.motion_replan_requested = False
+        self.motion_replan_reason = None
+        self.transient_runtime_blocked_edges = set()
         self.ir_route_scan_mm = None
 
         # Edge/event memory for IR sensors.
@@ -708,6 +753,10 @@ class DFSMazeExplorer:
         )
         print(
             " Gimbal     : absolute fast scan; recenter only at startup/cleanup"
+        )
+        print(
+            f" Maze       : dynamic size, physical grid=60cm, "
+            f"OPEN if ToF >= {TOF_OPEN_THRESHOLD_MM}mm"
         )
         print("============================================================")
 
@@ -1963,6 +2012,183 @@ class DFSMazeExplorer:
 
         return 0.0, "NO_SHARP_AUTHORITY"
 
+    def retreat_to_move_start(self, start_pos, reason=""):
+        """
+        Back out of a transient mid-edge safety event.
+
+        The robot keeps the same logical heading and drives x<0 toward the
+        source cell while:
+          - yaw hold keeps orientation locked
+          - one Sharp authority may still center laterally
+          - absolute chassis position confirms that distance to the original
+            start point is decreasing
+
+        We intentionally do NOT run the digital-IR recovery state machine
+        while retreating; otherwise the same side IR could recursively trigger
+        the exact recovery that we are trying to escape from.
+
+        Rear obstacle sensing is not available, so this maneuver is used only
+        to retrace the corridor the robot has just traversed moments earlier.
+        """
+        self.stop_chassis()
+        self.gimbal_front_down()
+
+        if start_pos is None:
+            print("[MOTION RETREAT] no original start pose -> cannot retreat")
+            return False
+
+        pos = self.state.get_position()
+
+        if pos is None:
+            print("[MOTION RETREAT] position telemetry unavailable")
+            return False
+
+        def distance_to_start(p):
+            return math.hypot(
+                p[0] - start_pos[0],
+                p[1] - start_pos[1],
+            )
+
+        initial_distance = distance_to_start(pos)
+
+        if initial_distance <= MOTION_ABORT_HOME_TOL_M:
+            print(
+                f"[MOTION RETREAT] already near source cell "
+                f"({initial_distance:.3f} m)"
+            )
+            return True
+
+        print(
+            f"[MOTION RETREAT] reason={reason or 'transient IR'} "
+            f"distance_to_source={initial_distance:.3f} m "
+            f"-> reverse at {MOTION_ABORT_RETREAT_SPEED_MPS:.2f} m/s"
+        )
+
+        target_yaw = self.yaw_ref_deg
+        best_distance = initial_distance
+        last_debug = 0.0
+        t0 = time.monotonic()
+
+        while self.running:
+            now = time.monotonic()
+            pos = self.state.get_position()
+
+            if pos is None:
+                self.stop_chassis()
+                print("[MOTION RETREAT FAIL] position telemetry lost")
+                return False
+
+            dist = distance_to_start(pos)
+
+            if dist <= MOTION_ABORT_HOME_TOL_M:
+                self.stop_chassis()
+                print(
+                    f"[MOTION RETREAT OK] back near source cell: "
+                    f"{dist:.3f} m"
+                )
+                return True
+
+            if now - t0 > MOTION_ABORT_TIMEOUT_SEC:
+                self.stop_chassis()
+                print(
+                    f"[MOTION RETREAT FAIL] timeout; "
+                    f"still {dist:.3f} m from source"
+                )
+                return False
+
+            # Detect going the wrong way / odometry disagreement.
+            if dist < best_distance:
+                best_distance = dist
+            elif dist > best_distance + MOTION_ABORT_PROGRESS_EPS_M:
+                self.stop_chassis()
+                print(
+                    f"[MOTION RETREAT FAIL] distance increased "
+                    f"best={best_distance:.3f} now={dist:.3f} m"
+                )
+                return False
+
+            left_cm, right_cm, _, _ = self.read_sharp_cm()
+            self.update_sharp_authority(left_cm, right_cm)
+            y_cmd, center_mode = self.corridor_lateral_command(
+                left_cm, right_cm
+            )
+
+            z_cmd = self.yaw_hold_command(
+                target_yaw,
+                stationary=False
+            )
+
+            self.chassis.drive_speed(
+                x=-MOTION_ABORT_RETREAT_SPEED_MPS,
+                y=y_cmd,
+                z=z_cmd,
+                timeout=DRIVE_COMMAND_TIMEOUT,
+            )
+
+            if now - last_debug >= 0.25:
+                print(
+                    f"[MOTION RETREAT] remaining={dist:.3f}m "
+                    f"mode={center_mode} "
+                    f"y={y_cmd:+.2f} z={z_cmd:+.1f}"
+                )
+                last_debug = now
+
+            time.sleep(0.03)
+
+        self.stop_chassis()
+        return False
+
+    def request_motion_replan_from_source(
+        self,
+        start_pos,
+        traveled,
+        reason,
+    ):
+        """
+        Handle an ambiguous/transient safety abort without poisoning the map.
+
+        Near the destination node:
+            accept arrival; node scan will classify topology.
+
+        Mid-edge:
+            retreat to the source cell and ask DFS to rescan/replan there.
+        """
+        self.stop_chassis()
+
+        if traveled >= CELL_LENGTH_M * CELL_SUCCESS_FRACTION:
+            print(
+                f"[MOTION REPLAN] {reason}; traveled={traveled:.3f}m "
+                ">= node-success threshold -> ACCEPT NODE EARLY"
+            )
+            self.ir_replan_requested = False
+            self.motion_replan_requested = False
+            self.motion_replan_reason = None
+            return "ACCEPT_NODE"
+
+        print(
+            f"[MOTION REPLAN] {reason}; traveled={traveled:.3f}m "
+            "before node -> RETREAT TO SOURCE CELL"
+        )
+
+        retreat_ok = self.retreat_to_move_start(
+            start_pos,
+            reason=reason,
+        )
+
+        if not retreat_ok:
+            self.stop_chassis()
+            return "RETREAT_FAILED"
+
+        self.ir_replan_requested = False
+        self.motion_replan_requested = True
+        self.motion_replan_reason = reason
+
+        # Release wall authority because the source-cell geometry will be
+        # observed again from a fresh stationary scan.
+        self._set_sharp_authority(None, "motion abort returned to source")
+
+        return "REPLAN_SOURCE"
+
     def move_one_cell(self):
         """
         Continuous corridor motion:
@@ -1972,6 +2198,9 @@ class DFSMazeExplorer:
           - front ToF collision stop
           - stop after CELL_LENGTH_M odometry displacement
         """
+
+        self.motion_replan_requested = False
+        self.motion_replan_reason = None
 
         self.gimbal_front_down()
 
@@ -2084,11 +2313,25 @@ class DFSMazeExplorer:
                     )
                     return True
 
-                print(
-                    f"[IR SEQUENCE MOVE] FRONT blocked, hint={action} "
-                    "before node -> stop edge"
+                result = self.request_motion_replan_from_source(
+                    start_pos=start_pos,
+                    traveled=traveled,
+                    reason=(
+                        f"IR sequence says FRONT blocked "
+                        f"(hint={action})"
+                    ),
                 )
-                return False
+
+                if result == "ACCEPT_NODE":
+                    return True
+
+                if result == "REPLAN_SOURCE":
+                    return False
+
+                raise RuntimeError(
+                    "IR sequence blocked motion and retreat to the source "
+                    "cell failed."
+                )
 
             # BOTH LOW is NOT two competing recovery commands.
             if ir_l_low and ir_r_low and not both_override:
@@ -2123,11 +2366,25 @@ class DFSMazeExplorer:
                     )
                     return True
 
-                print(
-                    f"[IR BOTH MOVE] FRONT blocked before node "
-                    f"(hint={action}, d={traveled:.3f}m) -> stop edge"
+                result = self.request_motion_replan_from_source(
+                    start_pos=start_pos,
+                    traveled=traveled,
+                    reason=(
+                        f"BOTH-IR says FRONT blocked "
+                        f"(hint={action})"
+                    ),
                 )
-                return False
+
+                if result == "ACCEPT_NODE":
+                    return True
+
+                if result == "REPLAN_SOURCE":
+                    return False
+
+                raise RuntimeError(
+                    "BOTH-IR blocked motion and retreat to the source "
+                    "cell failed."
+                )
 
             # ONE LOW keeps the unambiguous opposite-slide recovery.
             if (ir_l_low ^ ir_r_low) and not both_override:
@@ -2138,24 +2395,48 @@ class DFSMazeExplorer:
                 t0 += time.monotonic() - recovery_t0
 
                 if not ok:
-                    raise RuntimeError(
-                        "Single-IR clearance recovery failed during motion."
+                    result = self.request_motion_replan_from_source(
+                        start_pos=start_pos,
+                        traveled=traveled,
+                        reason="single-IR clearance recovery failed",
                     )
 
-                # Recovery can become BOTH LOW and ask for a DFS replan.
-                if self.ir_replan_requested:
-                    if traveled >= CELL_LENGTH_M * CELL_SUCCESS_FRACTION:
-                        print(
-                            "[IR MOVE] recovery requested replan near node "
-                            "-> accept node early"
-                        )
+                    if result == "ACCEPT_NODE":
                         return True
 
-                    print(
-                        "[IR MOVE] recovery requested replan before node "
-                        "-> stop edge"
+                    if result == "REPLAN_SOURCE":
+                        return False
+
+                    # Retreat itself failed.  This is the one case where
+                    # continuing autonomously would be unsafe.
+                    raise RuntimeError(
+                        "Single-IR recovery failed and the robot could not "
+                        "safely retreat to the source cell."
                     )
-                    return False
+
+                # Recovery can become BOTH LOW / side-blocked and ask for a
+                # route replan.  Treat it as a transient geometry event, not a
+                # confirmed permanent wall.
+                if self.ir_replan_requested:
+                    result = self.request_motion_replan_from_source(
+                        start_pos=start_pos,
+                        traveled=traveled,
+                        reason=(
+                            "IR/Gimbal requested replan after "
+                            "single-IR recovery"
+                        ),
+                    )
+
+                    if result == "ACCEPT_NODE":
+                        return True
+
+                    if result == "REPLAN_SOURCE":
+                        return False
+
+                    raise RuntimeError(
+                        "IR/Gimbal requested a motion replan but the robot "
+                        "could not safely retreat to the source cell."
+                    )
 
                 continue
 
@@ -2469,29 +2750,55 @@ class DFSMazeExplorer:
             f"\n[SCAN] cell={cell} heading={DIR_NAMES[self.heading]}"
         )
 
-        # IR supervisor before the normal cell scan.
-        # BOTH LOW must NOT produce two opposite slide commands.  We simply
-        # stop and let this cell's gimbal scan decide the available routes.
+        # ----------------------------------------------------
+        # NODE-SCAN IR POLICY
+        # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        # Once move_one_cell() has accepted that the robot has ARRIVED at a
+        # cell/node, IR LOW is no longer treated as a command to slide.
+        #
+        # Why:
+        #   - a wall can legitimately be very close at a junction/dead end
+        #   - move_one_cell() may accept the cell near the front wall
+        #   - sliding here can move the robot away from the intended node
+        #   - it can also create the old conflict:
+        #         "cell reached" -> IR slide -> front too close -> RuntimeError
+        #
+        # At a node, IR therefore acts only as a HIGH-PRIORITY TRIGGER:
+        #     STOP -> keep pose -> Gimbal scan LEFT / FRONT / RIGHT
+        #
+        # Recovery/sliding is still used during translation, during an
+        # explicit recovery slide, and after turns when corner clearance is
+        # actually required.
         pre_l_low, pre_r_low, pre_l_raw, pre_r_raw = self.read_ir_filtered()
         pre_dual_event, pre_dual_reason = self.consume_ir_dual_sequence()
 
         if pre_dual_event:
             self.stop_chassis()
             print(
-                f"[IR SEQUENCE SCAN {cell}] {pre_dual_reason} "
-                "-> no slide; Gimbal will classify routes"
+                f"[IR NODE SCAN {cell}] sequential event: "
+                f"{pre_dual_reason} -> HOLD POSITION + GIMBAL L/F/R"
             )
+
         elif pre_l_low and pre_r_low:
             self.stop_chassis()
             print(
-                f"[IR BOTH SCAN {cell}] IR_L={pre_l_raw} IR_R={pre_r_raw} "
-                "-> no slide; Gimbal will classify routes"
+                f"[IR NODE SCAN {cell}] BOTH LOW "
+                f"IR_L={pre_l_raw} IR_R={pre_r_raw} "
+                "-> HOLD POSITION + GIMBAL L/F/R"
             )
+
         elif pre_l_low or pre_r_low:
-            if not self.ir_clearance_recovery(context=f"SCAN {cell}"):
-                raise RuntimeError(
-                    f"IR clearance recovery failed before scanning cell {cell}."
-                )
+            self.stop_chassis()
+
+            side = "LEFT" if pre_l_low else "RIGHT"
+
+            print(
+                f"[IR NODE SCAN {cell}] {side} LOW "
+                f"IR_L={pre_l_raw} IR_R={pre_r_raw} "
+                "-> NO SLIDE; HOLD POSITION + GIMBAL L/F/R"
+            )
 
         # A cell scan itself is a fresh replan, so consume any old hint.
         self.ir_replan_requested = False
@@ -3042,6 +3349,18 @@ class DFSMazeExplorer:
 
             if not ok:
                 self.stop_chassis()
+
+                if self.motion_replan_requested:
+                    reason = self.motion_replan_reason
+                    self.motion_replan_requested = False
+                    self.motion_replan_reason = None
+
+                    raise RuntimeError(
+                        f"Known-map route was safely aborted and returned to "
+                        f"{current}: {reason}. The environment should be "
+                        "re-observed before trusting the saved route."
+                    )
+
                 raise RuntimeError(
                     f"Known-map motion failed at edge {current}->{target}. "
                     "The environment may have changed."
@@ -3162,6 +3481,288 @@ class DFSMazeExplorer:
             f"{len(seen)}/{len(self.known_map_cells)} cells reached"
         )
 
+    def has_unvisited_frontier(self):
+        """
+        True while the explored graph still contains something DFS must visit.
+
+        A visited-but-not-yet-scanned cell also counts as unfinished.
+        """
+        for cell in self.visited:
+            if cell not in self.open_dirs:
+                return True
+
+            for d in self.open_dirs.get(cell, []):
+                nb = neighbor(cell, d)
+
+                if self.is_blocked(cell, nb):
+                    continue
+
+                if nb not in self.visited:
+                    return True
+
+        return False
+
+    def confirmed_explored_neighbors(self, cell):
+        """
+        Safe graph used for the FAST RETURN HOME planner.
+
+        An edge is accepted when:
+          1) it is a parent-child edge that the robot physically traversed, OR
+          2) BOTH endpoint scans agree that the edge is open.
+
+        This means shortcuts/loops can be used for a faster return, while an
+        unconfirmed one-sided ToF opening is not blindly trusted.
+        """
+        result = []
+
+        for d in range(4):
+            nb = neighbor(cell, d)
+
+            if nb not in self.visited:
+                continue
+
+            if self.is_blocked(cell, nb):
+                continue
+
+            if self.edge_key(cell, nb) in self.transient_runtime_blocked_edges:
+                continue
+
+            physically_traversed = (
+                self.parent.get(cell) == nb
+                or self.parent.get(nb) == cell
+            )
+
+            reverse_d = (d + 2) % 4
+
+            mutually_scanned_open = (
+                d in self.open_dirs.get(cell, [])
+                and reverse_d in self.open_dirs.get(nb, [])
+            )
+
+            if physically_traversed or mutually_scanned_open:
+                result.append((d, nb))
+
+        return result
+
+    @staticmethod
+    def estimated_turn_time(from_heading, to_heading):
+        delta = (to_heading - from_heading) % 4
+
+        if delta == 0:
+            return 0.0
+
+        if delta == 2:
+            return FAST_RETURN_TURN_180_EST_SEC
+
+        return FAST_RETURN_TURN_90_EST_SEC
+
+    def plan_fastest_return(self, start, start_heading, goal):
+        """
+        Dijkstra over (cell, heading), not just cell.
+
+        Cost ~= chassis travel time + physical turn time.
+        Therefore among map routes it can choose one with fewer turns instead
+        of blindly taking a cell-count-only DFS parent path.
+        """
+        if start == goal:
+            return [], 0.0
+
+        # state = (cell, heading)
+        start_state = (start, start_heading % 4)
+
+        pq = [(0.0, start[0], start[1], start_heading % 4)]
+        best = {start_state: 0.0}
+        previous = {start_state: None}
+        previous_action = {}
+
+        goal_state = None
+
+        while pq:
+            cost, x, y, heading = heapq.heappop(pq)
+            cell = (x, y)
+            state = (cell, heading)
+
+            if cost > best.get(state, float("inf")) + 1e-9:
+                continue
+
+            if cell == goal:
+                goal_state = state
+                break
+
+            for d, nb in self.confirmed_explored_neighbors(cell):
+                step_cost = (
+                    FAST_RETURN_MOVE_EST_SEC
+                    + self.estimated_turn_time(heading, d)
+                )
+
+                next_state = (nb, d)
+                new_cost = cost + step_cost
+
+                if new_cost + 1e-9 < best.get(next_state, float("inf")):
+                    best[next_state] = new_cost
+                    previous[next_state] = state
+                    previous_action[next_state] = d
+
+                    heapq.heappush(
+                        pq,
+                        (new_cost, nb[0], nb[1], d)
+                    )
+
+        if goal_state is None:
+            raise RuntimeError(
+                f"No confirmed route from {start} to {goal}."
+            )
+
+        reversed_steps = []
+        cur = goal_state
+
+        while cur != start_state:
+            prev = previous[cur]
+
+            if prev is None:
+                raise RuntimeError("Fast-return path reconstruction failed.")
+
+            d = previous_action[cur]
+            target_cell = cur[0]
+            reversed_steps.append((d, target_cell))
+            cur = prev
+
+        reversed_steps.reverse()
+        return reversed_steps, best[goal_state]
+
+    def fast_return_home(self):
+        """
+        Return from the final DFS cell to root=(0,0) using the fastest
+        confirmed route currently known.
+
+        No topology scans are repeated.  Real-time IR/Sharp/ToF/yaw safety
+        remains active.  If a saved shortcut becomes blocked, that edge is
+        marked blocked and the route is replanned from the current cell.
+        """
+        if self.current == self.root:
+            print("[RETURN HOME] already at root.")
+            return
+
+        print("\n================ FAST RETURN HOME ================")
+        print(f"Current : {self.current}")
+        print(f"Home    : {self.root}")
+        print("Planner : confirmed-map Dijkstra (move + turn time)")
+        print("Safety  : IR + Sharp + front ToF + yaw hold remain active")
+        print("==================================================")
+
+        replans = 0
+        self.transient_runtime_blocked_edges.clear()
+
+        while self.running and self.current != self.root:
+            plan, estimated_sec = self.plan_fastest_return(
+                self.current,
+                self.heading,
+                self.root,
+            )
+
+            route_cells = [self.current] + [target for _, target in plan]
+
+            print(
+                f"[RETURN PLAN] moves={len(plan)} "
+                f"estimated_action_time={estimated_sec:.1f}s"
+            )
+            print(f"[RETURN PLAN] {route_cells}")
+
+            need_replan = False
+
+            for d, target in plan:
+                current = self.current
+
+                print(
+                    f"\n[RETURN] {current} -> {target} "
+                    f"dir={DIR_NAMES[d]}"
+                )
+
+                self.turn_to_direction(d)
+
+                # AFTER_TURN IR/Gimbal may decide that the mapped direction
+                # is no longer safe.  Do not force the old map.
+                if self.ir_replan_requested:
+                    self.ir_replan_requested = False
+                    self.stop_chassis()
+
+                    print(
+                        f"[RETURN REPLAN] current sensors reject "
+                        f"{current}->{target}; mark blocked"
+                    )
+
+                    self.mark_blocked(current, target)
+                    need_replan = True
+                    break
+
+                ok = self.move_one_cell()
+
+                if not ok:
+                    self.stop_chassis()
+
+                    if self.motion_replan_requested:
+                        reason = self.motion_replan_reason
+                        self.motion_replan_requested = False
+                        self.motion_replan_reason = None
+
+                        print(
+                            f"[RETURN REPLAN] transient safety abort "
+                            f"{current}->{target}: {reason}; "
+                            "returned to source, do NOT permanently block edge"
+                        )
+
+                        # Avoid immediately selecting the exact same edge
+                        # again during this return attempt, without persisting
+                        # it as a permanent WALL in the learned map.
+                        self.transient_runtime_blocked_edges.add(
+                            self.edge_key(current, target)
+                        )
+                        need_replan = True
+                        break
+
+                    print(
+                        f"[RETURN REPLAN] failed edge "
+                        f"{current}->{target}; mark blocked"
+                    )
+
+                    self.mark_blocked(current, target)
+                    need_replan = True
+                    break
+
+                self.current = target
+
+                print(f"[RETURN] arrived {self.current}")
+
+                if MAP_AUTOSAVE:
+                    self.save_map(final=False)
+
+                if self.current == self.root:
+                    break
+
+            if self.current == self.root:
+                break
+
+            if not need_replan:
+                raise RuntimeError(
+                    "Fast-return plan ended before reaching home."
+                )
+
+            replans += 1
+
+            if replans > FAST_RETURN_MAX_REPLANS:
+                raise RuntimeError(
+                    "Fast return exceeded replan limit; robot stopped."
+                )
+
+        self.stop_chassis()
+        self.gimbal_front_down()
+
+        if self.current == self.root:
+            print(
+                f"\n[RETURN HOME OK] reached {self.root} "
+                f"heading={DIR_NAMES[self.heading]}"
+            )
+
     def print_map_summary(self):
         print("\n================ DFS MAP SUMMARY ================")
         print(f"Visited cells: {len(self.visited)}")
@@ -3200,6 +3801,7 @@ class DFSMazeExplorer:
         self.current = self.root
 
         stack = [self.root]
+        exploration_finished = False
 
         print("\n[DFS] START")
         print(f"[DFS] root={self.root}, heading={DIR_NAMES[self.heading]}")
@@ -3213,6 +3815,29 @@ class DFSMazeExplorer:
 
                 if MAP_AUTOSAVE:
                     self.save_map(final=False)
+
+            # ------------------------------------------------
+            # GLOBAL EXPLORATION-COMPLETE CHECK
+            # ------------------------------------------------
+            # If NO visited cell has an unvisited open neighbor anymore, the
+            # maze has been fully explored.  Do NOT keep unwinding the DFS
+            # parent stack just to get back to root.  Break here and use the
+            # completed map to take the fastest confirmed route home.
+            if not self.has_unvisited_frontier():
+                exploration_finished = True
+
+                print(
+                    f"\n[DFS] ALL FRONTIERS COMPLETE at {cell}. "
+                    "Exploration finished."
+                )
+
+                if cell != self.root and FAST_RETURN_HOME_AFTER_DFS:
+                    print(
+                        "[DFS] skip remaining DFS-stack backtracking; "
+                        "FAST RETURN HOME will plan directly to (0, 0)."
+                    )
+
+                break
 
             # ------------------------------------------------
             # HARD DEAD-END OVERRIDE
@@ -3314,6 +3939,28 @@ class DFSMazeExplorer:
                 ok = self.move_one_cell()
 
                 if not ok:
+                    # A transient IR/corner event may have safely returned the
+                    # robot to the SAME source cell.  In that case do not poison
+                    # the topology by permanently blocking the edge.  Throw
+                    # away this cell's scan and observe it again.
+                    if self.motion_replan_requested:
+                        reason = self.motion_replan_reason
+
+                        print(
+                            f"[DFS] transient motion abort at {cell}: "
+                            f"{reason} -> RESCAN SAME CELL; edge is NOT blocked"
+                        )
+
+                        self.motion_replan_requested = False
+                        self.motion_replan_reason = None
+                        self.ir_replan_requested = False
+                        self.open_dirs.pop(cell, None)
+
+                        if MAP_AUTOSAVE:
+                            self.save_map(final=False)
+
+                        continue
+
                     print(
                         f"[DFS] edge {cell}->{next_cell} failed; "
                         f"mark blocked and continue."
@@ -3351,6 +3998,7 @@ class DFSMazeExplorer:
             if parent is None:
                 print("\n[DFS] Root has no unvisited neighbors.")
                 print("[DFS] COMPLETE.")
+                exploration_finished = True
                 break
 
             back_dir = direction_between(cell, parent)
@@ -3387,13 +4035,43 @@ class DFSMazeExplorer:
             if MAP_AUTOSAVE:
                 self.save_map(final=False)
 
-        # Reaching here without an exception means DFS finished normally.
+        # Ctrl+C / external stop must never label a partial map as complete.
+        if not self.running:
+            self.stop_chassis()
+
+            if MAP_AUTOSAVE:
+                self.save_map(final=False)
+
+            print("[DFS] stopped before full exploration completed.")
+            return
+
+        # Defensive fallback: if the loop ended naturally, verify the global
+        # graph really has no remaining frontier.
+        if not exploration_finished:
+            exploration_finished = not self.has_unvisited_frontier()
+
+        if not exploration_finished:
+            self.stop_chassis()
+            raise RuntimeError(
+                "DFS loop ended while an unexplored frontier still exists."
+            )
+
         self.map_complete = True
 
+        # Save the COMPLETED learned map before driving home.
         self.stop_chassis()
         self.gimbal_front_down()
         self.print_map_summary()
         self.save_map(final=True)
+
+        # The robot can finish exploration at the far end of the last branch.
+        # Use the completed graph to return directly instead of DFS-parent
+        # backtracking all the way to root.
+        if FAST_RETURN_HOME_AFTER_DFS and self.current != self.root:
+            self.fast_return_home()
+
+        elif self.current == self.root:
+            print("[RETURN HOME] DFS completed at root; no return trip needed.")
 
 
 # ============================================================
