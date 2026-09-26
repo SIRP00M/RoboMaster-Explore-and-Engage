@@ -20,6 +20,7 @@ Behavior:
   - Front ToF is always a collision stop while moving.
   - Chassis yaw hold reduces gradual Z-axis drift.
   - Persistent JSON + ASCII map is autosaved while exploring.
+  - A wall-map SVG image is also autosaved so the maze can be seen directly.
   - Saved maps can be replayed later without re-discovering topology.
   - Known-map mode can BFS to a requested goal cell.
   - Node scans never perform IR lateral recovery; IR LOW at a node triggers
@@ -306,8 +307,9 @@ MAP_SCHEMA_VERSION = 1
 MAP_DIR = Path("maps")
 MAP_LATEST_JSON = MAP_DIR / "latest_map.json"
 MAP_LATEST_ASCII = MAP_DIR / "latest_map.txt"
+MAP_LATEST_SVG = MAP_DIR / "latest_map.svg"
 
-# Save latest_map.json/.txt after every meaningful topology change.
+# Save latest_map.json/.txt/.svg after every meaningful topology change.
 # This protects the learned map even if the run is interrupted later.
 MAP_AUTOSAVE = True
 
@@ -3108,9 +3110,214 @@ class DFSMazeExplorer:
 
         return "\n".join(lines)
 
+
+    def render_svg_map(self):
+        """
+        Render a wall map as SVG.
+
+        Visual language:
+          - each mapped cell is a square
+          - black thick lines = confirmed walls
+          - gaps = confirmed open directions
+          - red X = blocked/failed edge
+          - green = root/start, blue = visited, red = hard dead-end
+          - orange arrow = open frontier to an unmapped cell
+        """
+        cells = self.mapped_cells()
+
+        if not cells:
+            return """<svg xmlns="http://www.w3.org/2000/svg" width="800" height="240" viewBox="0 0 800 240">
+  <rect width="100%" height="100%" fill="white"/>
+  <text x="40" y="70" font-family="Arial, sans-serif" font-size="28" fill="#111">RoboMaster Maze Map</text>
+  <text x="40" y="120" font-family="Arial, sans-serif" font-size="22" fill="#666">(map empty)</text>
+</svg>
+"""
+
+        min_x = min(c[0] for c in cells)
+        max_x = max(c[0] for c in cells)
+        min_y = min(c[1] for c in cells)
+        max_y = max(c[1] for c in cells)
+
+        cell_px = 96
+        margin = 88
+        header_h = 120
+        legend_h = 110
+        wall_stroke = 8
+        thin_stroke = 2
+
+        cols = max_x - min_x + 1
+        rows = max_y - min_y + 1
+
+        width = margin * 2 + cols * cell_px + 1
+        height = header_h + rows * cell_px + legend_h + 1
+
+        def cell_xy(cell):
+            x, y = cell
+            px = margin + (x - min_x) * cell_px
+            py = header_h + (max_y - y) * cell_px
+            return px, py
+
+        def side_segment(px, py, d):
+            if d == 0:   # N
+                return (px, py, px + cell_px, py)
+            if d == 1:   # E
+                return (px + cell_px, py, px + cell_px, py + cell_px)
+            if d == 2:   # S
+                return (px, py + cell_px, px + cell_px, py + cell_px)
+            # W
+            return (px, py, px, py + cell_px)
+
+        def opening_midpoint(px, py, d):
+            if d == 0:
+                return (px + cell_px / 2, py)
+            if d == 1:
+                return (px + cell_px, py + cell_px / 2)
+            if d == 2:
+                return (px + cell_px / 2, py + cell_px)
+            return (px, py + cell_px / 2)
+
+        def cell_fill(cell):
+            if cell == self.root:
+                return "#d7f8d0"
+            if cell in self.dead_end_cells:
+                return "#ffd7d7"
+            if cell in self.visited:
+                return "#d9e9ff"
+            return "#efefef"
+
+        svg = []
+        append = svg.append
+
+        append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">')
+        append('<rect width="100%" height="100%" fill="white"/>')
+
+        # Title / meta
+        append('<text x="28" y="42" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#111">RoboMaster Maze Map</text>')
+        append(f'<text x="28" y="74" font-family="Arial, sans-serif" font-size="18" fill="#444">Cells: {len(cells)} | Complete: {self.map_complete} | Root: {self.root} | Grid pitch: {CELL_LENGTH_M:.2f} m | Open threshold: {TOF_OPEN_THRESHOLD_MM} mm</text>')
+        append('<text x="28" y="100" font-family="Arial, sans-serif" font-size="16" fill="#666">North is up. Thick black edges are walls. Gaps are open passages.</text>')
+
+        # Border around map area
+        append(f'<rect x="{margin - 10}" y="{header_h - 10}" width="{cols * cell_px + 20}" height="{rows * cell_px + 20}" fill="none" stroke="#cfcfcf" stroke-width="2"/>')
+
+        # Light grid background
+        for c in range(cols + 1):
+            x = margin + c * cell_px
+            append(f'<line x1="{x}" y1="{header_h}" x2="{x}" y2="{header_h + rows * cell_px}" stroke="#f1f1f1" stroke-width="1"/>')
+        for r in range(rows + 1):
+            y = header_h + r * cell_px
+            append(f'<line x1="{margin}" y1="{y}" x2="{margin + cols * cell_px}" y2="{y}" stroke="#f1f1f1" stroke-width="1"/>')
+
+        # Draw cells
+        for cell in sorted(cells, key=lambda p: (p[1], p[0])):
+            px, py = cell_xy(cell)
+            fill = cell_fill(cell)
+            append(f'<rect x="{px}" y="{py}" width="{cell_px}" height="{cell_px}" fill="{fill}" fill-opacity="0.55" stroke="none"/>')
+
+            # cell label / coordinate
+            label = "S" if cell == self.root else ("D" if cell in self.dead_end_cells else "o")
+            append(f'<text x="{px + 8}" y="{py + 22}" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#222">{label}</text>')
+            append(f'<text x="{px + 8}" y="{py + cell_px - 10}" font-family="Consolas, monospace" font-size="13" fill="#333">({cell[0]},{cell[1]})</text>')
+
+            # Optional scan values
+            scan = self.cell_scan_mm.get(cell)
+            if isinstance(scan, dict):
+                small = []
+                if scan.get("LEFT") is not None:
+                    small.append(f"L{int(scan['LEFT'])}")
+                if scan.get("FRONT") is not None:
+                    small.append(f"F{int(scan['FRONT'])}")
+                if scan.get("RIGHT") is not None:
+                    small.append(f"R{int(scan['RIGHT'])}")
+                if small:
+                    scan_txt = " ".join(small)
+                    append(f'<text x="{px + 8}" y="{py + 40}" font-family="Consolas, monospace" font-size="11" fill="#555">{scan_txt}</text>')
+
+            open_dirs = set(self.open_dirs.get(cell, []))
+
+            # Open-frontier marker: direction is open from this cell, but the
+            # destination cell has not been mapped yet.
+            for d in open_dirs:
+                nb = neighbor(cell, d)
+                if nb in cells or self.is_blocked(cell, nb):
+                    continue
+
+                mx, my = opening_midpoint(px, py, d)
+                if d == 0:
+                    points = f"{mx},{my - 14} {mx - 8},{my - 2} {mx + 8},{my - 2}"
+                elif d == 1:
+                    points = f"{mx + 14},{my} {mx + 2},{my - 8} {mx + 2},{my + 8}"
+                elif d == 2:
+                    points = f"{mx},{my + 14} {mx - 8},{my + 2} {mx + 8},{my + 2}"
+                else:
+                    points = f"{mx - 14},{my} {mx - 2},{my - 8} {mx - 2},{my + 8}"
+
+                append(f'<polygon points="{points}" fill="#ff9800" fill-opacity="0.95"/>')
+
+            # Walls
+            for d in range(4):
+                nb = neighbor(cell, d)
+                is_open = d in open_dirs and not self.is_blocked(cell, nb)
+
+                if not is_open:
+                    x1, y1, x2, y2 = side_segment(px, py, d)
+                    append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#111" stroke-width="{wall_stroke}" stroke-linecap="square"/>')
+
+        # Blocked/failed edges as red X between cells
+        for edge in sorted(self.blocked_edges):
+            a, b = edge
+            if a not in cells or b not in cells:
+                continue
+
+            ax, ay = cell_xy(a)
+            bx, by = cell_xy(b)
+            cx = (ax + bx) / 2 + cell_px / 2
+            cy = (ay + by) / 2 + cell_px / 2
+            s = 12
+            append(f'<line x1="{cx - s}" y1="{cy - s}" x2="{cx + s}" y2="{cy + s}" stroke="#d32f2f" stroke-width="4"/>')
+            append(f'<line x1="{cx - s}" y1="{cy + s}" x2="{cx + s}" y2="{cy - s}" stroke="#d32f2f" stroke-width="4"/>')
+
+        # North arrow
+        nx = width - 70
+        ny = 55
+        append(f'<line x1="{nx}" y1="{ny + 28}" x2="{nx}" y2="{ny - 10}" stroke="#111" stroke-width="4"/>')
+        append(f'<polygon points="{nx},{ny - 24} {nx - 10},{ny - 4} {nx + 10},{ny - 4}" fill="#111"/>')
+        append(f'<text x="{nx - 7}" y="{ny + 50}" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#111">N</text>')
+
+        # Legend
+        lx = 28
+        ly = header_h + rows * cell_px + 38
+        append(f'<text x="{lx}" y="{ly - 10}" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#111">Legend</text>')
+
+        # start
+        append(f'<rect x="{lx}" y="{ly + 6}" width="22" height="22" fill="#d7f8d0" stroke="#666"/>')
+        append(f'<text x="{lx + 34}" y="{ly + 23}" font-family="Arial, sans-serif" font-size="16" fill="#333">Start / root</text>')
+
+        # visited
+        append(f'<rect x="{lx + 200}" y="{ly + 6}" width="22" height="22" fill="#d9e9ff" stroke="#666"/>')
+        append(f'<text x="{lx + 234}" y="{ly + 23}" font-family="Arial, sans-serif" font-size="16" fill="#333">Visited cell</text>')
+
+        # dead end
+        append(f'<rect x="{lx + 390}" y="{ly + 6}" width="22" height="22" fill="#ffd7d7" stroke="#666"/>')
+        append(f'<text x="{lx + 424}" y="{ly + 23}" font-family="Arial, sans-serif" font-size="16" fill="#333">Dead-end cell</text>')
+
+        # wall sample
+        y2 = ly + 58
+        append(f'<line x1="{lx}" y1="{y2}" x2="{lx + 26}" y2="{y2}" stroke="#111" stroke-width="{wall_stroke}" />')
+        append(f'<text x="{lx + 34}" y="{y2 + 6}" font-family="Arial, sans-serif" font-size="16" fill="#333">Wall</text>')
+
+        append(f'<line x1="{lx + 200}" y1="{y2}" x2="{lx + 226}" y2="{y2}" stroke="#d32f2f" stroke-width="4" />')
+        append(f'<line x1="{lx + 200}" y1="{y2 + 12}" x2="{lx + 226}" y2="{y2 - 12}" stroke="#d32f2f" stroke-width="4" />')
+        append(f'<text x="{lx + 234}" y="{y2 + 6}" font-family="Arial, sans-serif" font-size="16" fill="#333">Blocked / failed edge</text>')
+
+        append(f'<polygon points="{lx + 430},{y2 - 14} {lx + 422},{y2 - 2} {lx + 438},{y2 - 2}" fill="#ff9800"/>')
+        append(f'<text x="{lx + 448}" y="{y2 + 6}" font-family="Arial, sans-serif" font-size="16" fill="#333">Open frontier to unmapped area</text>')
+
+        append('</svg>')
+        return "\n".join(svg)
+
     def save_map(self, final=False):
         """
-        Save reusable JSON + human-readable ASCII map.
+        Save reusable JSON + human-readable ASCII + SVG wall map.
 
         latest_map.* is overwritten intentionally.
         A timestamped snapshot is also created when final=True.
@@ -3137,6 +3344,12 @@ class DFSMazeExplorer:
         tmp_txt.write_text(ascii_text, encoding="utf-8")
         os.replace(tmp_txt, MAP_LATEST_ASCII)
 
+        svg_text = self.render_svg_map()
+
+        tmp_svg = MAP_LATEST_SVG.with_suffix(".svg.tmp")
+        tmp_svg.write_text(svg_text, encoding="utf-8")
+        os.replace(tmp_svg, MAP_LATEST_SVG)
+
         snapshot = None
 
         if final:
@@ -3150,10 +3363,14 @@ class DFSMazeExplorer:
             ascii_snapshot = MAP_DIR / f"maze_{stamp}.txt"
             ascii_snapshot.write_text(ascii_text, encoding="utf-8")
 
+            svg_snapshot = MAP_DIR / f"maze_{stamp}.svg"
+            svg_snapshot.write_text(svg_text, encoding="utf-8")
+
         print(
             f"[MAP SAVE] cells={len(payload['cells'])} "
             f"complete={payload['complete']} -> {MAP_LATEST_JSON}"
         )
+        print(f"[MAP SAVE] wall image -> {MAP_LATEST_SVG}")
 
         if snapshot is not None:
             print(f"[MAP SNAPSHOT] {snapshot}")
