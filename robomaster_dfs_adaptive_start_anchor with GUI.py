@@ -50,6 +50,7 @@ import heapq
 import json
 import math
 import os
+import queue
 import statistics
 import threading
 import time
@@ -670,6 +671,921 @@ def adc_to_cm(adc, calibration):
 
 
 # ============================================================
+# MISSION CONTROL GUI
+# ============================================================
+
+class MissionControlGUI:
+    """
+    Thread-isolated Tkinter mission-control window.
+
+    The RoboMaster/DFS code remains on the mission thread.  Tkinter owns its
+    own GUI thread and receives immutable snapshots through a Queue, so the UI
+    never iterates live DFS dictionaries while they are being modified.
+
+    During normal exploration the window is read-only.  After the robot has
+    returned to START and one or more EXIT_CANDIDATE edges exist, the operator
+    can select a specific candidate, preview its shortest confirmed route,
+    then explicitly continue through that edge or finish the mission.
+    """
+
+    POLL_MS = 100
+
+    def __init__(self, explorer):
+        self.explorer = explorer
+        self.messages = queue.Queue(maxsize=80)
+        self.ready_event = threading.Event()
+        self.closed_event = threading.Event()
+        self.decision_event = threading.Event()
+
+        self.available = False
+        self.thread = None
+        self.start_error = None
+
+        self.decision = None
+        self.selected_candidate_key = None
+
+        # GUI-thread-only fields are initialized in _run().
+        self.root = None
+        self.canvas = None
+        self.status_var = None
+        self.mode_var = None
+        self.telemetry_var = None
+        self.candidate_list = None
+        self.candidate_detail_var = None
+        self.continue_button = None
+        self.finish_button = None
+        self.estop_button = None
+
+        self.latest_snapshot = None
+        self.candidate_options = []
+        self.candidate_by_index = []
+        self.selected_option = None
+        self.marker_hits = []
+        self.mission_complete = False
+
+    # --------------------------------------------------------
+    # Public / mission-thread API
+    # --------------------------------------------------------
+
+    def start(self, timeout=3.0):
+        if self.thread is not None:
+            return self.available
+
+        self.thread = threading.Thread(
+            target=self._run,
+            name='RoboMasterMissionControlGUI',
+            daemon=True,
+        )
+        self.thread.start()
+        self.ready_event.wait(timeout=max(0.2, float(timeout)))
+
+        if not self.available:
+            if self.start_error:
+                print(f'[GUI WARN] Mission Control unavailable: {self.start_error}')
+            else:
+                print('[GUI WARN] Mission Control did not become ready; using terminal fallback.')
+
+        return self.available
+
+    def _post(self, kind, payload=None):
+        if not self.available and kind != 'close':
+            return False
+
+        item = (kind, payload)
+        try:
+            self.messages.put_nowait(item)
+            return True
+        except queue.Full:
+            # Keep the newest state.  Dropping an old visual snapshot is fine;
+            # decision messages are retried after freeing one slot.
+            try:
+                self.messages.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.messages.put_nowait(item)
+                return True
+            except queue.Full:
+                return False
+
+    def post_snapshot(self, snapshot):
+        return self._post('snapshot', snapshot)
+
+    def post_mission_complete(self, snapshot=None):
+        if snapshot is not None:
+            self.post_snapshot(snapshot)
+        return self._post('mission_complete', None)
+
+    def request_exit_decision(self, options, snapshot=None):
+        """
+        Block the mission thread while the GUI stays responsive.
+
+        Returns:
+            ('continue', ((x, y), dir_index))
+            ('finish', None)
+            None  -> GUI unavailable/closed, caller should use terminal fallback
+        """
+        if not self.available or self.closed_event.is_set():
+            return None
+
+        self.decision = None
+        self.selected_candidate_key = None
+        self.decision_event.clear()
+
+        payload = {
+            'options': options,
+            'snapshot': snapshot,
+        }
+        if not self._post('exit_decision', payload):
+            return None
+
+        while self.explorer.running and self.available:
+            if self.decision_event.wait(0.10):
+                break
+
+        if not self.decision_event.is_set():
+            return None
+
+        return self.decision, self.selected_candidate_key
+
+    def close(self):
+        if self.available:
+            self._post('close', None)
+
+    def wait_closed(self, timeout=None):
+        return self.closed_event.wait(timeout=timeout)
+
+    # --------------------------------------------------------
+    # GUI thread
+    # --------------------------------------------------------
+
+    def _run(self):
+        try:
+            import tkinter as tk
+            from tkinter import ttk, messagebox
+
+            self.tk = tk
+            self.ttk = ttk
+            self.messagebox = messagebox
+
+            root = tk.Tk()
+            self.root = root
+            root.title('RoboMaster Maze Mission Control')
+            root.geometry('1180x760')
+            root.minsize(900, 620)
+            root.configure(bg='#0d1117')
+
+            # A compact dark ttk theme without third-party dependencies.
+            style = ttk.Style(root)
+            try:
+                style.theme_use('clam')
+            except Exception:
+                pass
+            style.configure('MC.TFrame', background='#0d1117')
+            style.configure('Panel.TFrame', background='#161b22')
+            style.configure(
+                'MC.TLabel',
+                background='#0d1117',
+                foreground='#e6edf3',
+                font=('Segoe UI', 10),
+            )
+            style.configure(
+                'Title.TLabel',
+                background='#0d1117',
+                foreground='#f0f6fc',
+                font=('Segoe UI Semibold', 16),
+            )
+            style.configure(
+                'Status.TLabel',
+                background='#161b22',
+                foreground='#58a6ff',
+                font=('Segoe UI Semibold', 11),
+                padding=(10, 8),
+            )
+            style.configure(
+                'Panel.TLabel',
+                background='#161b22',
+                foreground='#c9d1d9',
+                font=('Segoe UI', 10),
+            )
+            style.configure(
+                'Section.TLabel',
+                background='#161b22',
+                foreground='#f0f6fc',
+                font=('Segoe UI Semibold', 11),
+            )
+            style.configure('Accent.TButton', font=('Segoe UI Semibold', 10), padding=(10, 8))
+            style.configure('Danger.TButton', font=('Segoe UI Semibold', 10), padding=(10, 8))
+
+            root.columnconfigure(0, weight=1)
+            root.rowconfigure(2, weight=1)
+
+            header = ttk.Frame(root, style='MC.TFrame', padding=(16, 12, 16, 8))
+            header.grid(row=0, column=0, sticky='ew')
+            header.columnconfigure(1, weight=1)
+
+            ttk.Label(
+                header,
+                text='RoboMaster Maze Mission Control',
+                style='Title.TLabel',
+            ).grid(row=0, column=0, sticky='w')
+
+            self.mode_var = tk.StringVar(value='GUI READY')
+            ttk.Label(
+                header,
+                textvariable=self.mode_var,
+                style='MC.TLabel',
+                anchor='e',
+            ).grid(row=0, column=1, sticky='e')
+
+            self.status_var = tk.StringVar(value='Waiting for robot state...')
+            ttk.Label(
+                root,
+                textvariable=self.status_var,
+                style='Status.TLabel',
+                anchor='w',
+            ).grid(row=1, column=0, sticky='ew', padx=16, pady=(0, 10))
+
+            body = ttk.Frame(root, style='MC.TFrame', padding=(16, 0, 16, 12))
+            body.grid(row=2, column=0, sticky='nsew')
+            body.columnconfigure(0, weight=1)
+            body.columnconfigure(1, weight=0)
+            body.rowconfigure(0, weight=1)
+
+            map_panel = ttk.Frame(body, style='Panel.TFrame', padding=8)
+            map_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
+            map_panel.columnconfigure(0, weight=1)
+            map_panel.rowconfigure(1, weight=1)
+
+            ttk.Label(
+                map_panel,
+                text='Live DFS Map',
+                style='Section.TLabel',
+            ).grid(row=0, column=0, sticky='w', padx=4, pady=(2, 8))
+
+            self.canvas = tk.Canvas(
+                map_panel,
+                bg='#0b0f14',
+                highlightthickness=1,
+                highlightbackground='#30363d',
+                bd=0,
+            )
+            self.canvas.grid(row=1, column=0, sticky='nsew')
+            self.canvas.bind('<Configure>', lambda _e: self._draw_map())
+            self.canvas.bind('<Button-1>', self._on_map_click)
+
+            side = ttk.Frame(body, style='Panel.TFrame', padding=12, width=340)
+            side.grid(row=0, column=1, sticky='ns')
+            side.grid_propagate(False)
+            side.columnconfigure(0, weight=1)
+
+            ttk.Label(side, text='Exit Candidates', style='Section.TLabel').grid(
+                row=0, column=0, sticky='w'
+            )
+            ttk.Label(
+                side,
+                text='Available after the robot returns to START. Select an Exit to preview the confirmed shortest route.',
+                style='Panel.TLabel',
+                wraplength=310,
+                justify='left',
+            ).grid(row=1, column=0, sticky='ew', pady=(4, 8))
+
+            self.candidate_list = tk.Listbox(
+                side,
+                height=10,
+                exportselection=False,
+                bg='#0d1117',
+                fg='#e6edf3',
+                selectbackground='#1f6feb',
+                selectforeground='white',
+                highlightthickness=1,
+                highlightbackground='#30363d',
+                relief='flat',
+                font=('Consolas', 10),
+            )
+            self.candidate_list.grid(row=2, column=0, sticky='ew')
+            self.candidate_list.bind('<<ListboxSelect>>', self._on_list_select)
+
+            self.candidate_detail_var = tk.StringVar(
+                value='No Exit selection is active.'
+            )
+            ttk.Label(
+                side,
+                textvariable=self.candidate_detail_var,
+                style='Panel.TLabel',
+                wraplength=310,
+                justify='left',
+            ).grid(row=3, column=0, sticky='ew', pady=(10, 10))
+
+            self.continue_button = ttk.Button(
+                side,
+                text='CONTINUE VIA SELECTED EXIT',
+                style='Accent.TButton',
+                command=self._continue_selected,
+                state='disabled',
+            )
+            self.continue_button.grid(row=4, column=0, sticky='ew', pady=(0, 6))
+
+            self.finish_button = ttk.Button(
+                side,
+                text='FINISH MISSION AT START',
+                command=self._finish_selected,
+                state='disabled',
+            )
+            self.finish_button.grid(row=5, column=0, sticky='ew', pady=(0, 12))
+
+            ttk.Separator(side, orient='horizontal').grid(
+                row=6, column=0, sticky='ew', pady=(0, 10)
+            )
+
+            ttk.Label(side, text='Live State', style='Section.TLabel').grid(
+                row=7, column=0, sticky='w'
+            )
+            self.telemetry_var = tk.StringVar(value='No telemetry yet.')
+            ttk.Label(
+                side,
+                textvariable=self.telemetry_var,
+                style='Panel.TLabel',
+                wraplength=310,
+                justify='left',
+            ).grid(row=8, column=0, sticky='ew', pady=(4, 14))
+
+            self.estop_button = ttk.Button(
+                side,
+                text='EMERGENCY STOP',
+                style='Danger.TButton',
+                command=self._emergency_stop,
+            )
+            self.estop_button.grid(row=9, column=0, sticky='ew')
+
+            footer = ttk.Label(
+                root,
+                text='Purple E# = EXIT_CANDIDATE   •   Blue line = selected shortest confirmed route   •   Yellow triangle = robot',
+                style='MC.TLabel',
+                anchor='w',
+            )
+            footer.grid(row=3, column=0, sticky='ew', padx=16, pady=(0, 10))
+
+            root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+            self.available = True
+            self.ready_event.set()
+            root.after(self.POLL_MS, self._process_messages)
+            root.mainloop()
+
+        except Exception as e:
+            self.start_error = e
+            self.available = False
+            self.ready_event.set()
+        finally:
+            self.available = False
+            if not self.decision_event.is_set():
+                self.decision = 'finish'
+                self.selected_candidate_key = None
+                self.decision_event.set()
+
+            # Tk/Tcl objects must be released by the same thread that created
+            # the interpreter.  Keeping StringVar/root references on the
+            # MissionControlGUI object until Python exits can otherwise cause
+            # Tcl_AsyncDelete / Variable.__del__ errors on shutdown.
+            try:
+                self.canvas = None
+                self.status_var = None
+                self.mode_var = None
+                self.telemetry_var = None
+                self.candidate_list = None
+                self.candidate_detail_var = None
+                self.continue_button = None
+                self.finish_button = None
+                self.estop_button = None
+                self.root = None
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+
+            self.closed_event.set()
+
+    def _process_messages(self):
+        if not self.available or self.root is None:
+            return
+
+        processed = 0
+        while processed < 30:
+            try:
+                kind, payload = self.messages.get_nowait()
+            except queue.Empty:
+                break
+
+            processed += 1
+
+            if kind == 'snapshot':
+                self._apply_snapshot(payload)
+
+            elif kind == 'exit_decision':
+                snapshot = payload.get('snapshot') if isinstance(payload, dict) else None
+                if snapshot is not None:
+                    self._apply_snapshot(snapshot)
+                options = payload.get('options', []) if isinstance(payload, dict) else []
+                self._enter_exit_decision(options)
+
+            elif kind == 'mission_complete':
+                self.mission_complete = True
+                self.mode_var.set('MISSION COMPLETE')
+                self.status_var.set('Mission finished. Map remains available for inspection.')
+                self.continue_button.configure(state='disabled')
+                self.finish_button.configure(state='disabled')
+
+            elif kind == 'close':
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                return
+
+        if self.available and self.root is not None:
+            self.root.after(self.POLL_MS, self._process_messages)
+
+    def _apply_snapshot(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return
+
+        self.latest_snapshot = snapshot
+        status = snapshot.get('status') or 'RUNNING'
+        self.status_var.set(status)
+
+        current = tuple(snapshot.get('current', (0, 0)))
+        heading_idx = int(snapshot.get('heading', 0)) % 4
+        heading = DIR_NAMES[heading_idx]
+        visited_count = len(snapshot.get('visited', []))
+        exit_count = len(snapshot.get('exit_candidates', []))
+        pos = snapshot.get('position')
+        pos_txt = 'n/a'
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+            try:
+                pos_txt = f'({float(pos[0]):+.2f}, {float(pos[1]):+.2f}) m'
+            except Exception:
+                pass
+
+        self.telemetry_var.set(
+            f'Cell: {current}\n'
+            f'Heading: {heading}\n'
+            f'Visited: {visited_count}\n'
+            f'Exit candidates: {exit_count}\n'
+            f'Chassis odom XY: {pos_txt}'
+        )
+        self._draw_map()
+
+    def _enter_exit_decision(self, options):
+        self.candidate_options = list(options or [])
+        self.candidate_by_index = []
+        self.selected_option = None
+        self.candidate_list.delete(0, self.tk.END)
+
+        for option in self.candidate_options:
+            if not option.get('reachable', True):
+                continue
+            self.candidate_by_index.append(option)
+            cid = option.get('id', '?')
+            cell = tuple(option.get('cell', (0, 0)))
+            direction = option.get('dir', '?')
+            moves = option.get('moves')
+            self.candidate_list.insert(
+                self.tk.END,
+                f'{cid:<3}  {cell!s:<10} -> {direction}   {moves} moves'
+            )
+
+        self.mode_var.set('WAITING FOR EXIT SELECTION')
+        self.status_var.set(
+            'Robot is safely at START. Select the EXIT_CANDIDATE you want to inspect.'
+        )
+        self.finish_button.configure(state='normal')
+        self.continue_button.configure(state='disabled')
+
+        if self.candidate_by_index:
+            self.candidate_list.selection_set(0)
+            self.candidate_list.activate(0)
+            self._select_option(self.candidate_by_index[0])
+        else:
+            self.candidate_detail_var.set('No reachable EXIT_CANDIDATE.')
+
+        self._draw_map()
+
+    def _on_list_select(self, _event=None):
+        selected = self.candidate_list.curselection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        if 0 <= idx < len(self.candidate_by_index):
+            self._select_option(self.candidate_by_index[idx])
+
+    def _select_option(self, option):
+        self.selected_option = option
+        key = option.get('key')
+        self.selected_candidate_key = key
+
+        cid = option.get('id', '?')
+        cell = tuple(option.get('cell', (0, 0)))
+        direction = option.get('dir', '?')
+        moves = option.get('moves', 0)
+        distance_m = option.get('route_distance_m', 0.0)
+        front = option.get('front_mm')
+        reason = option.get('reason', 'unknown')
+        path = option.get('path', [])
+        front_txt = 'n/a' if front is None else f'{float(front):.0f} mm'
+
+        self.candidate_detail_var.set(
+            f'{cid}: source {cell} -> {direction}\n'
+            f'Shortest confirmed route: {moves} cell moves\n'
+            f'Approx. route to source: {distance_m:.2f} m\n'
+            f'Front ToF when recorded: {front_txt}\n'
+            f'Reason: {reason}\n'
+            f'Path: {path}'
+        )
+        self.continue_button.configure(state='normal')
+
+        # Mirror selection in listbox when the map marker was clicked.
+        for i, item in enumerate(self.candidate_by_index):
+            if item.get('key') == key:
+                self.candidate_list.selection_clear(0, self.tk.END)
+                self.candidate_list.selection_set(i)
+                self.candidate_list.activate(i)
+                self.candidate_list.see(i)
+                break
+
+        self._draw_map()
+
+    def _continue_selected(self):
+        if self.selected_option is None:
+            return
+
+        cid = self.selected_option.get('id', '?')
+        cell = tuple(self.selected_option.get('cell', (0, 0)))
+        direction = self.selected_option.get('dir', '?')
+
+        ok = self.messagebox.askyesno(
+            'Confirm EXIT traversal',
+            f'Continue via {cid}: {cell} -> {direction}?\n\n'
+            'The robot will first follow the displayed shortest confirmed route, '
+            'then cross only this approved EXIT edge. Collision safety remains active.',
+            parent=self.root,
+        )
+        if not ok:
+            return
+
+        self.decision = 'continue'
+        self.selected_candidate_key = self.selected_option.get('key')
+        self.continue_button.configure(state='disabled')
+        self.finish_button.configure(state='disabled')
+        self.mode_var.set('EXIT ROUTE APPROVED')
+        self.status_var.set(f"Operator approved {cid}. Robot may leave START.")
+        self.decision_event.set()
+
+    def _finish_selected(self):
+        ok = self.messagebox.askyesno(
+            'Finish mission',
+            'Finish the mission at START and do not traverse any deferred EXIT_CANDIDATE?',
+            parent=self.root,
+        )
+        if not ok:
+            return
+
+        self.decision = 'finish'
+        self.selected_candidate_key = None
+        self.continue_button.configure(state='disabled')
+        self.finish_button.configure(state='disabled')
+        self.mode_var.set('FINISH SELECTED')
+        self.status_var.set('Operator selected FINISH at START.')
+        self.decision_event.set()
+
+    def _emergency_stop(self):
+        ok = self.messagebox.askyesno(
+            'Emergency stop',
+            'Stop the current mission?\n\nMotion loops will exit and the chassis will be stopped by cleanup.',
+            parent=self.root,
+        )
+        if not ok:
+            return
+
+        self.explorer.running = False
+        self.decision = 'finish'
+        self.selected_candidate_key = None
+        self.decision_event.set()
+        self.mode_var.set('STOP REQUESTED')
+        self.status_var.set('Emergency stop requested. Waiting for motion loop to stop...')
+        self.continue_button.configure(state='disabled')
+        self.finish_button.configure(state='disabled')
+
+    def _on_close(self):
+        if not self.mission_complete and self.explorer.running:
+            ok = self.messagebox.askyesno(
+                'Close Mission Control',
+                'Closing Mission Control during a mission will request a safe stop. Continue?',
+                parent=self.root,
+            )
+            if not ok:
+                return
+            self.explorer.running = False
+            self.decision = 'finish'
+            self.selected_candidate_key = None
+            self.decision_event.set()
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Live map drawing
+    # --------------------------------------------------------
+
+    def _on_map_click(self, event):
+        if not self.candidate_by_index:
+            return
+
+        best = None
+        best_d2 = None
+        for x, y, option in self.marker_hits:
+            d2 = (float(event.x) - x) ** 2 + (float(event.y) - y) ** 2
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best = option
+
+        if best is not None and best_d2 is not None and best_d2 <= 28.0 ** 2:
+            self._select_option(best)
+
+    @staticmethod
+    def _dir_vec_screen(direction):
+        direction = int(direction) % 4
+        if direction == 0:
+            return (0, -1)
+        if direction == 1:
+            return (1, 0)
+        if direction == 2:
+            return (0, 1)
+        return (-1, 0)
+
+    def _draw_map(self):
+        canvas = self.canvas
+        snap = self.latest_snapshot
+        if canvas is None:
+            return
+
+        canvas.delete('all')
+        self.marker_hits = []
+
+        if not isinstance(snap, dict):
+            canvas.create_text(
+                24, 24,
+                anchor='nw',
+                text='Waiting for map data...',
+                fill='#8b949e',
+                font=('Segoe UI', 12),
+            )
+            return
+
+        cells = {tuple(c) for c in snap.get('cells', [])}
+        if not cells:
+            cells.add(tuple(snap.get('root', (0, 0))))
+
+        root_cell = tuple(snap.get('root', (0, 0)))
+        current = tuple(snap.get('current', root_cell))
+        cells.add(root_cell)
+        cells.add(current)
+
+        exits = list(snap.get('exit_candidates', []))
+        open_map = {
+            tuple(item['cell']): set(int(d) for d in item.get('dirs', []))
+            for item in snap.get('open_dirs', [])
+        }
+        blocked = {
+            frozenset((tuple(edge[0]), tuple(edge[1])))
+            for edge in snap.get('blocked_edges', [])
+            if isinstance(edge, (list, tuple)) and len(edge) == 2
+        }
+        visited = {tuple(c) for c in snap.get('visited', [])}
+        dead = {tuple(c) for c in snap.get('dead_end_cells', [])}
+
+        candidate_keys = {
+            (tuple(item.get('cell', (0, 0))), int(item.get('dir_index', 0)) % 4)
+            for item in exits
+        }
+
+        min_x = min(c[0] for c in cells)
+        max_x = max(c[0] for c in cells)
+        min_y = min(c[1] for c in cells)
+        max_y = max(c[1] for c in cells)
+
+        w = max(420, int(canvas.winfo_width()))
+        h = max(420, int(canvas.winfo_height()))
+        pad = 54
+        cols = max(1, max_x - min_x + 1)
+        rows = max(1, max_y - min_y + 1)
+        cell_size = min(96.0, (w - 2 * pad) / cols, (h - 2 * pad) / rows)
+        cell_size = max(38.0, cell_size)
+
+        map_w = (max_x - min_x) * cell_size
+        map_h = (max_y - min_y) * cell_size
+        origin_x = (w - map_w) / 2.0
+        origin_y = (h - map_h) / 2.0
+
+        def center(cell):
+            x, y = cell
+            cx = origin_x + (x - min_x) * cell_size
+            cy = origin_y + (max_y - y) * cell_size
+            return cx, cy
+
+        # Cells are drawn as a true edge-to-edge grid.  The previous GUI used
+        # smaller node boxes plus graph-link lines between their centres, which
+        # made the maze look like a graph instead of the physical 60 cm grid.
+        # With half == cell_size / 2 every neighbouring cell touches exactly at
+        # its shared boundary; OPEN edges are gaps in the wall, not connector
+        # lines between nodes.
+        half = cell_size * 0.50
+
+        # Cells + wall segments.
+        entrance_dir = int(snap.get('known_entrance_dir', 2)) % 4
+        ingress_dir = int(snap.get('known_maze_ingress_dir', 0)) % 4
+
+        for cell in sorted(cells, key=lambda p: (p[1], p[0])):
+            cx, cy = center(cell)
+            x1, y1, x2, y2 = cx - half, cy - half, cx + half, cy + half
+
+            if cell == root_cell:
+                fill = '#173d2a'
+            elif cell == current:
+                fill = '#5a4714'
+            elif cell in dead:
+                fill = '#4a2024'
+            elif cell in visited:
+                fill = '#172b42'
+            else:
+                fill = '#21262d'
+
+            # Edge-to-edge tile.  A very thin neutral outline keeps individual
+            # cells readable while preserving the continuous grid appearance.
+            # Confirmed walls are drawn afterward with a much heavier stroke.
+            canvas.create_rectangle(
+                x1, y1, x2, y2,
+                fill=fill,
+                outline='#30363d',
+                width=1,
+            )
+            canvas.create_text(
+                cx, cy + half - 12,
+                text=f'({cell[0]},{cell[1]})',
+                fill='#8b949e',
+                font=('Consolas', max(8, int(cell_size * 0.11))),
+            )
+
+            opens = open_map.get(cell, set())
+            for d in range(4):
+                vx, vy = DIR_VEC[d]
+                nb = (cell[0] + vx, cell[1] + vy)
+                edge = frozenset((cell, nb))
+
+                special_open = (
+                    (cell, d) in candidate_keys
+                    or (cell == root_cell and d == entrance_dir)
+                    or (cell == root_cell and d == ingress_dir)
+                )
+                is_open = (d in opens and edge not in blocked) or special_open
+                if is_open:
+                    continue
+
+                if d == 0:
+                    coords = (x1, y1, x2, y1)
+                elif d == 1:
+                    coords = (x2, y1, x2, y2)
+                elif d == 2:
+                    coords = (x1, y2, x2, y2)
+                else:
+                    coords = (x1, y1, x1, y2)
+                canvas.create_line(*coords, fill='#f0f6fc', width=max(2, int(cell_size * 0.055)))
+
+        # Route overlay is intentionally drawn AFTER the grid cells/walls.
+        # With edge-to-edge cells there is no inter-node gap anymore, so drawing
+        # this underneath the cells would hide the route completely.
+        # During normal autonomous motion this comes from the
+        # explorer snapshot (return-home / navigation route). During EXIT
+        # selection the locally selected candidate preview takes priority.
+        selected_path = [tuple(c) for c in snap.get('route_preview', [])]
+        selected_dir = None
+        if self.selected_option is not None:
+            selected_path = [tuple(c) for c in self.selected_option.get('path', [])]
+            selected_dir = self.selected_option.get('dir_index')
+
+        if len(selected_path) >= 2:
+            pts = []
+            for cell in selected_path:
+                pts.extend(center(cell))
+            canvas.create_line(
+                *pts,
+                fill='#58a6ff',
+                width=7,
+                capstyle='round',
+                joinstyle='round',
+            )
+
+        if selected_path and selected_dir is not None:
+            sx, sy = center(selected_path[-1])
+            dx, dy = self._dir_vec_screen(selected_dir)
+            ex = sx + dx * cell_size * 0.72
+            ey = sy + dy * cell_size * 0.72
+            canvas.create_line(
+                sx, sy, ex, ey,
+                fill='#58a6ff', width=7, arrow=self.tk.LAST,
+                arrowshape=(12, 14, 6),
+            )
+
+        # Blocked edges as red X.
+        for edge in blocked:
+            pts = list(edge)
+            if len(pts) != 2 or pts[0] not in cells or pts[1] not in cells:
+                continue
+            ax, ay = center(pts[0])
+            bx, by = center(pts[1])
+            mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+            s = 8
+            canvas.create_line(mx - s, my - s, mx + s, my + s, fill='#f85149', width=3)
+            canvas.create_line(mx - s, my + s, mx + s, my - s, fill='#f85149', width=3)
+
+        # Exit markers. Prefer the decision-option IDs when available.
+        option_by_key = {
+            option.get('key'): option for option in self.candidate_options
+        }
+
+        for idx, item in enumerate(exits, start=1):
+            cell = tuple(item.get('cell', (0, 0)))
+            d = int(item.get('dir_index', 0)) % 4
+            key = (cell, d)
+            option = option_by_key.get(key)
+            cid = option.get('id') if option else f'E{idx}'
+
+            cx, cy = center(cell)
+            dx, dy = self._dir_vec_screen(d)
+            mx = cx + dx * half
+            my = cy + dy * half
+            ox = cx + dx * cell_size * 0.55
+            oy = cy + dy * cell_size * 0.55
+
+            selected = (
+                self.selected_option is not None
+                and self.selected_option.get('key') == key
+            )
+            color = '#d2a8ff' if selected else '#a371f7'
+            radius = 14 if selected else 11
+            canvas.create_line(mx, my, ox, oy, fill=color, width=4, arrow=self.tk.LAST)
+            canvas.create_oval(
+                ox - radius, oy - radius, ox + radius, oy + radius,
+                fill=color, outline='#ffffff', width=2,
+            )
+            canvas.create_text(
+                ox, oy,
+                text=str(cid),
+                fill='#0d1117',
+                font=('Segoe UI Semibold', 8),
+            )
+            if option is not None:
+                self.marker_hits.append((ox, oy, option))
+
+        # Root marker.
+        rx, ry = center(root_cell)
+        canvas.create_text(
+            rx, ry - 2,
+            text='S',
+            fill='#7ee787',
+            font=('Segoe UI Semibold', max(12, int(cell_size * 0.20))),
+        )
+
+        # Robot heading triangle.
+        cx, cy = center(current)
+        heading = int(snap.get('heading', 0)) % 4
+        dx, dy = self._dir_vec_screen(heading)
+        px, py = -dy, dx
+        tip_x = cx + dx * cell_size * 0.25
+        tip_y = cy + dy * cell_size * 0.25
+        back_x = cx - dx * cell_size * 0.15
+        back_y = cy - dy * cell_size * 0.15
+        side = cell_size * 0.14
+        points = (
+            tip_x, tip_y,
+            back_x + px * side, back_y + py * side,
+            back_x - px * side, back_y - py * side,
+        )
+        canvas.create_polygon(
+            points,
+            fill='#f2cc60',
+            outline='#ffffff',
+            width=2,
+        )
+
+        # North indicator.
+        canvas.create_text(26, 22, text='N', fill='#e6edf3', font=('Segoe UI Semibold', 12))
+        canvas.create_line(26, 56, 26, 32, fill='#e6edf3', width=3, arrow=self.tk.LAST)
+
+
+# ============================================================
 # ROBOT STATE
 # ============================================================
 
@@ -806,6 +1722,21 @@ class DFSMazeExplorer:
         # Deferred wide-open boundary directions.
         # key = (cell_tuple, absolute_direction_index)
         self.exit_candidates = {}
+
+        # Cells reached only after the operator explicitly approves crossing
+        # a deferred EXIT_CANDIDATE. The first cell beyond an approved exit
+        # is allowed to be scanned as a real continuation area instead of
+        # being immediately rolled back by the OPEN-AREA TRAP fallback.
+        # All later edges still use the normal exit guards.
+        self.approved_exit_entry_cells = set()
+
+        # Optional live Mission Control GUI.  It receives immutable snapshots
+        # from this mission thread and never reads mutable DFS containers
+        # directly.
+        self.mission_gui = None
+        self.gui_status_text = "INITIALIZING"
+        self.gui_route_preview = []
+        self.operator_selected_exit_candidate = None
 
         # Start heading is N (0), so root-back is the physical known entrance.
         # It remains excluded from DFS but is drawn/saved explicitly.
@@ -3100,6 +4031,7 @@ class DFSMazeExplorer:
             self.yaw_ref_deg = target_yaw
             self.hold_heading_stationary(0.15)
             self.gimbal_front_down()
+            self.publish_gui_state()
             return
 
         self.stop_chassis()
@@ -3164,6 +4096,10 @@ class DFSMazeExplorer:
             raise RuntimeError(
                 "IR remained unsafe after turn/corner-clearance recovery."
             )
+
+        # Heading changes are reflected immediately in Mission Control even
+        # before the next topology autosave.
+        self.publish_gui_state()
 
 
     # --------------------------------------------------------
@@ -4804,6 +5740,10 @@ class DFSMazeExplorer:
         if snapshot is not None:
             print(f"[MAP SNAPSHOT] {snapshot}")
 
+        # The SVG/JSON remain the persistent outputs, while Mission Control
+        # receives the same topology immediately for live rendering.
+        self.publish_gui_state()
+
         return MAP_LATEST_JSON
 
     def load_map(self, map_path):
@@ -5335,6 +6275,7 @@ class DFSMazeExplorer:
         print("Planner : confirmed-map Dijkstra (move + turn time)")
         print("Safety  : IR + Sharp + front ToF + yaw hold remain active")
         print("==================================================")
+        self.set_gui_status("RETURNING TO START")
 
         replans = 0
         self.transient_runtime_blocked_edges.clear()
@@ -5347,6 +6288,7 @@ class DFSMazeExplorer:
             )
 
             route_cells = [self.current] + [target for _, target in plan]
+            self.set_gui_status("RETURNING TO START", route=route_cells)
 
             print(
                 f"[RETURN PLAN] moves={len(plan)} "
@@ -5448,6 +6390,588 @@ class DFSMazeExplorer:
                 f"\n[RETURN HOME OK] reached {self.root} "
                 f"heading={DIR_NAMES[self.heading]}"
             )
+            self.set_gui_status("AT START - RETURN COMPLETE", route=[self.root])
+
+    def shortest_confirmed_path(self, start, goal):
+        """
+        BFS shortest path over the already explored/confirmed graph.
+
+        This is intentionally different from plan_fastest_return(): here the
+        operator asked for the shortest route in CELL COUNT back to an
+        EXIT_CANDIDATE source cell.  Safety checks still run while executing
+        the path.
+        """
+        start = tuple(start)
+        goal = tuple(goal)
+
+        if start == goal:
+            return [start]
+
+        if start not in self.visited:
+            raise ValueError(f"Start cell not explored: {start}")
+
+        if goal not in self.visited:
+            raise ValueError(f"Goal cell not explored: {goal}")
+
+        q = deque([start])
+        came_from = {start: None}
+
+        while q:
+            cell = q.popleft()
+
+            if cell == goal:
+                break
+
+            for _d, nb in self.confirmed_explored_neighbors(cell):
+                if nb in came_from:
+                    continue
+
+                came_from[nb] = cell
+                q.append(nb)
+
+        if goal not in came_from:
+            raise RuntimeError(
+                f"No confirmed shortest path from {start} to {goal}."
+            )
+
+        path = []
+        cur = goal
+
+        while cur is not None:
+            path.append(cur)
+            cur = came_from[cur]
+
+        path.reverse()
+        return path
+
+    def navigate_shortest_confirmed_to(self, goal):
+        """
+        Navigate to one already-explored cell using the shortest confirmed
+        path by number of grid edges.
+
+        If a live safety sensor rejects an old edge, replan from the current
+        cell instead of forcing the saved topology.
+        """
+        goal = tuple(goal)
+
+        if self.current == goal:
+            print(f"[EXIT ROUTE] already at candidate source {goal}")
+            return True
+
+        print("\n================ EXIT ROUTE =====================")
+        print(f"Current : {self.current}")
+        print(f"Target  : {goal}")
+        print("Planner : BFS shortest confirmed path (minimum cells)")
+        print("Safety  : IR + Sharp + front ToF + yaw hold remain active")
+        print("==================================================")
+
+        replans = 0
+        self.transient_runtime_blocked_edges.clear()
+
+        while self.running and self.current != goal:
+            try:
+                path = self.shortest_confirmed_path(self.current, goal)
+            except Exception as e:
+                self.stop_chassis()
+                print(
+                    f"[EXIT ROUTE] no safe confirmed route from "
+                    f"{self.current} to {goal}: {e}"
+                )
+                return False
+
+            print(
+                f"[EXIT ROUTE PLAN] moves={max(0, len(path) - 1)} "
+                f"path={path}"
+            )
+
+            need_replan = False
+
+            for target in path[1:]:
+                current = self.current
+                d = direction_between(current, target)
+
+                print(
+                    f"\n[EXIT ROUTE] {current} -> {target} "
+                    f"dir={DIR_NAMES[d]}"
+                )
+
+                self.turn_to_direction(d)
+
+                if self.ir_replan_requested:
+                    self.ir_replan_requested = False
+                    self.stop_chassis()
+                    print(
+                        f"[EXIT ROUTE REPLAN] sensors reject "
+                        f"{current}->{target}; mark blocked"
+                    )
+                    self.mark_blocked(current, target)
+                    need_replan = True
+                    break
+
+                ok = self.move_one_cell()
+
+                if not ok:
+                    self.stop_chassis()
+
+                    if self.motion_replan_requested:
+                        reason = self.motion_replan_reason
+                        self.motion_replan_requested = False
+                        self.motion_replan_reason = None
+
+                        print(
+                            f"[EXIT ROUTE REPLAN] transient abort "
+                            f"{current}->{target}: {reason}"
+                        )
+
+                        self.transient_runtime_blocked_edges.add(
+                            self.edge_key(current, target)
+                        )
+                        need_replan = True
+                        break
+
+                    print(
+                        f"[EXIT ROUTE REPLAN] failed edge "
+                        f"{current}->{target}; mark blocked"
+                    )
+                    self.mark_blocked(current, target)
+                    need_replan = True
+                    break
+
+                self.current = target
+                print(f"[EXIT ROUTE] arrived {self.current}")
+
+                if MAP_AUTOSAVE:
+                    self.save_map(final=False)
+
+                if self.current == goal:
+                    break
+
+            if self.current == goal:
+                break
+
+            if not need_replan:
+                return False
+
+            replans += 1
+
+            if replans > FAST_RETURN_MAX_REPLANS:
+                print("[EXIT ROUTE] replan limit exceeded")
+                return False
+
+        self.stop_chassis()
+        self.gimbal_front_down()
+        return self.current == goal
+
+    def choose_nearest_exit_candidate(self):
+        """
+        Choose the reachable deferred EXIT_CANDIDATE whose SOURCE cell is
+        closest to the current robot position in confirmed grid-edge count.
+        """
+        if not self.exit_candidates:
+            return None
+
+        ranked = []
+
+        # Do not let an old transient block from the home trip poison the
+        # operator-requested route selection.
+        self.transient_runtime_blocked_edges.clear()
+
+        for (cell, d), rec in self.exit_candidates.items():
+            try:
+                path = self.shortest_confirmed_path(self.current, cell)
+            except Exception as e:
+                print(
+                    f"[EXIT ROUTE] skip unreachable candidate "
+                    f"{cell}->{DIR_NAMES[d]}: {e}"
+                )
+                continue
+
+            ranked.append(
+                (
+                    len(path) - 1,
+                    cell[1],
+                    cell[0],
+                    d,
+                    tuple(cell),
+                    rec,
+                    path,
+                )
+            )
+
+        if not ranked:
+            return None
+
+        ranked.sort(key=lambda item: item[:4])
+        moves, _y, _x, d, cell, rec, path = ranked[0]
+
+        print("\n[EXIT SELECT] nearest deferred candidate")
+        print(
+            f"[EXIT SELECT] source={cell} dir={DIR_NAMES[d]} "
+            f"shortest_moves={moves}"
+        )
+        print(f"[EXIT SELECT] route={path}")
+
+        return cell, d, rec
+
+    def prompt_after_return_home(self):
+        """
+        Ask the operator what to do only AFTER the robot is safely back at
+        root.  Mission Control is preferred; terminal selection is the safe
+        fallback if Tkinter/display is unavailable.
+        """
+        if self.current != self.root or not self.exit_candidates:
+            self.operator_selected_exit_candidate = None
+            return "finish"
+
+        options = self.build_exit_candidate_options()
+        reachable = [opt for opt in options if opt.get('reachable')]
+
+        if not reachable:
+            print('[EXIT DECISION] no reachable EXIT_CANDIDATE from START')
+            self.operator_selected_exit_candidate = None
+            return 'finish'
+
+        self.set_gui_status('WAITING FOR EXIT SELECTION', route=[self.root])
+
+        if self.mission_gui is not None and self.mission_gui.available:
+            result = self.mission_gui.request_exit_decision(
+                options,
+                snapshot=self.build_gui_snapshot(),
+            )
+
+            if result is not None:
+                action, candidate_key = result
+                if action == 'continue' and candidate_key in self.exit_candidates:
+                    self.operator_selected_exit_candidate = candidate_key
+                    return 'continue'
+
+                self.operator_selected_exit_candidate = None
+                return 'finish'
+
+        # ----------------------------------------------------
+        # Terminal fallback: still allows choosing ANY candidate.
+        # ----------------------------------------------------
+        print("\n================ EXIT DECISION ==================")
+        print(f"Deferred EXIT_CANDIDATES: {len(self.exit_candidates)}")
+        print("Robot is back at START (0, 0).")
+        print("  [0] FINISH MISSION")
+
+        for index, opt in enumerate(reachable, start=1):
+            print(
+                f"  [{index}] {opt['id']} source={opt['cell']} "
+                f"dir={opt['dir']} shortest={opt['moves']} moves "
+                f"front={opt.get('front_mm')}mm"
+            )
+            print(f"      path={opt['path']}")
+
+        print("==================================================")
+
+        while self.running:
+            try:
+                raw = input(
+                    f"Select 0=FINISH or 1-{len(reachable)}=EXIT [default 0]: "
+                ).strip().lower()
+            except EOFError:
+                print("[EXIT DECISION] no interactive input -> FINISH")
+                self.operator_selected_exit_candidate = None
+                return "finish"
+
+            if raw in ("", "0", "f", "finish", "end", "stop"):
+                self.operator_selected_exit_candidate = None
+                return "finish"
+
+            try:
+                index = int(raw)
+            except ValueError:
+                print("Please enter a candidate number or 0 to finish.")
+                continue
+
+            if 1 <= index <= len(reachable):
+                selected = reachable[index - 1]
+                self.operator_selected_exit_candidate = selected['key']
+                print(
+                    f"[EXIT SELECT] operator chose {selected['id']} "
+                    f"{selected['cell']}->{selected['dir']}"
+                )
+                return "continue"
+
+            print("Selection out of range.")
+
+        self.operator_selected_exit_candidate = None
+        return "finish"
+
+    def cross_selected_exit_candidate(self, candidate_key=None):
+        """
+        Route to the operator-selected deferred candidate, cross that one edge
+        with the normal collision/safety layers still active, and attach the
+        new cell to the existing DFS graph so exploration can resume there.
+
+        The exit classifier itself is bypassed only for this operator-approved
+        edge; subsequent edges use normal EXIT_CANDIDATE protection again.
+        """
+        if candidate_key is None:
+            candidate_key = self.operator_selected_exit_candidate
+
+        if candidate_key is None:
+            # Compatibility/safety fallback for non-GUI callers.
+            selected = self.choose_nearest_exit_candidate()
+            if selected is None:
+                print("[EXIT CONTINUE] no reachable EXIT_CANDIDATE remains")
+                return False
+            source_cell, abs_dir, _rec = selected
+            candidate_key = self.exit_candidate_key(source_cell, abs_dir)
+        else:
+            source_cell = tuple(candidate_key[0])
+            abs_dir = int(candidate_key[1]) % 4
+            candidate_key = self.exit_candidate_key(source_cell, abs_dir)
+            _rec = self.exit_candidates.get(candidate_key)
+            if _rec is None:
+                print(
+                    f"[EXIT CONTINUE] selected candidate no longer exists: "
+                    f"{source_cell}->{DIR_NAMES[abs_dir]}"
+                )
+                return False
+
+        try:
+            preview_path = self.shortest_confirmed_path(self.current, source_cell)
+        except Exception as e:
+            print(f"[EXIT CONTINUE] selected candidate unreachable: {e}")
+            return False
+
+        self.set_gui_status(
+            f"NAVIGATING TO SELECTED EXIT {source_cell}->{DIR_NAMES[abs_dir]}",
+            route=preview_path,
+        )
+
+        if not self.navigate_shortest_confirmed_to(source_cell):
+            print(
+                f"[EXIT CONTINUE] could not reach candidate source "
+                f"{source_cell}"
+            )
+            return False
+
+        destination = neighbor(source_cell, abs_dir)
+        key = self.exit_candidate_key(source_cell, abs_dir)
+
+        print("\n================ CROSS APPROVED EXIT ============")
+        print(f"Source      : {source_cell}")
+        print(f"Direction   : {DIR_NAMES[abs_dir]}")
+        print(f"Destination : {destination}")
+        print("Exit guard  : bypassed for THIS edge only")
+        print("Safety      : IR + Sharp + front ToF + yaw hold ACTIVE")
+        print("==================================================")
+        self.set_gui_status(
+            f"CROSSING APPROVED EXIT {source_cell}->{DIR_NAMES[abs_dir]}",
+            route=[source_cell],
+        )
+
+        self.turn_to_direction(abs_dir)
+
+        if self.ir_replan_requested:
+            self.ir_replan_requested = False
+            self.stop_chassis()
+            print(
+                "[EXIT CONTINUE] live IR/Gimbal safety rejects the approved "
+                "exit edge; not forcing motion"
+            )
+            return False
+
+        # detect_exit=False is deliberate: the operator has explicitly
+        # approved this single deferred edge. Collision safety remains active.
+        ok = self.move_one_cell(
+            source_cell=source_cell,
+            abs_dir=abs_dir,
+            detect_exit=False,
+        )
+
+        if not ok:
+            self.stop_chassis()
+            print("[EXIT CONTINUE] approved exit crossing failed safely")
+            return False
+
+        # Commit the approved connection only after a successful crossing.
+        self.exit_candidates.pop(key, None)
+
+        if abs_dir not in self.open_dirs.get(source_cell, []):
+            self.open_dirs.setdefault(source_cell, []).append(abs_dir)
+
+        if destination not in self.visited:
+            self.parent[destination] = source_cell
+            self.visited.add(destination)
+        elif destination not in self.parent:
+            self.parent[destination] = source_cell
+
+        self.current = destination
+        self.approved_exit_entry_cells.add(destination)
+        self.map_complete = False
+
+        # Force a fresh topology scan beyond the approved boundary.
+        self.open_dirs.pop(destination, None)
+        self.cell_scan_mm.pop(destination, None)
+        self.dead_end_cells.discard(destination)
+
+        print(
+            f"[EXIT CONTINUE OK] crossed to {destination}; "
+            "resuming DFS from the new side"
+        )
+        self.operator_selected_exit_candidate = None
+        self.set_gui_status(
+            f"EXIT CROSSED - RESUMING DFS AT {destination}",
+            route=[destination],
+        )
+
+        if MAP_AUTOSAVE:
+            self.save_map(final=False)
+
+        return True
+
+    # --------------------------------------------------------
+    # MISSION CONTROL GUI SNAPSHOTS
+    # --------------------------------------------------------
+
+    def attach_mission_gui(self, gui):
+        self.mission_gui = gui
+        self.publish_gui_state()
+
+    def set_gui_status(self, status, route=None):
+        self.gui_status_text = str(status)
+        if route is not None:
+            self.gui_route_preview = [tuple(c) for c in route]
+        self.publish_gui_state()
+
+    def build_gui_snapshot(self):
+        """Build an immutable GUI snapshot on the mission thread."""
+        cells = sorted(self.mapped_cells(), key=lambda p: (p[1], p[0]))
+        pos = self.state.get_position()
+
+        exit_records = []
+        for (cell, d), rec in sorted(
+            self.exit_candidates.items(),
+            key=lambda item: (
+                item[0][0][1], item[0][0][0], item[0][1]
+            ),
+        ):
+            exit_records.append({
+                'cell': [int(cell[0]), int(cell[1])],
+                'dir_index': int(d),
+                'dir': DIR_NAMES[d],
+                'front_mm': rec.get('front_mm'),
+                'reason': rec.get('reason'),
+            })
+
+        return {
+            'status': self.gui_status_text,
+            'root': [int(self.root[0]), int(self.root[1])],
+            'current': [int(self.current[0]), int(self.current[1])],
+            'heading': int(self.heading) % 4,
+            'position': None if pos is None else [float(v) for v in pos],
+            'cells': [[int(c[0]), int(c[1])] for c in cells],
+            'visited': [
+                [int(c[0]), int(c[1])]
+                for c in sorted(self.visited, key=lambda p: (p[1], p[0]))
+            ],
+            'dead_end_cells': [
+                [int(c[0]), int(c[1])]
+                for c in sorted(self.dead_end_cells, key=lambda p: (p[1], p[0]))
+            ],
+            'open_dirs': [
+                {
+                    'cell': [int(cell[0]), int(cell[1])],
+                    'dirs': [int(d) for d in dirs],
+                }
+                for cell, dirs in sorted(
+                    self.open_dirs.items(), key=lambda item: (item[0][1], item[0][0])
+                )
+            ],
+            'blocked_edges': [
+                [
+                    [int(a[0]), int(a[1])],
+                    [int(b[0]), int(b[1])],
+                ]
+                for a, b in sorted(self.blocked_edges)
+            ],
+            'exit_candidates': exit_records,
+            'known_entrance_dir': int(self.known_entrance_dir),
+            'known_maze_ingress_dir': int(self.known_maze_ingress_dir),
+            'route_preview': [
+                [int(c[0]), int(c[1])] for c in self.gui_route_preview
+            ],
+            'map_complete': bool(self.map_complete),
+        }
+
+    def publish_gui_state(self):
+        gui = self.mission_gui
+        if gui is None or not gui.available:
+            return False
+        try:
+            return gui.post_snapshot(self.build_gui_snapshot())
+        except Exception as e:
+            print(f'[GUI WARN] state publish failed: {e}')
+            return False
+
+    def build_exit_candidate_options(self):
+        """
+        Build all reachable deferred exits for operator selection.
+
+        Candidates are ranked by confirmed shortest-path cell count from the
+        robot's current location, but the GUI never auto-selects a winner for
+        motion; the operator can choose any reachable E# entry.
+        """
+        options = []
+        self.transient_runtime_blocked_edges.clear()
+
+        raw = []
+        for (cell, d), rec in self.exit_candidates.items():
+            key = (tuple(cell), int(d) % 4)
+            try:
+                path = self.shortest_confirmed_path(self.current, cell)
+                reachable = True
+                moves = len(path) - 1
+            except Exception as e:
+                path = []
+                reachable = False
+                moves = 10 ** 9
+                error = str(e)
+            else:
+                error = None
+
+            raw.append((
+                0 if reachable else 1,
+                moves,
+                cell[1],
+                cell[0],
+                d,
+                key,
+                rec,
+                path,
+                error,
+            ))
+
+        raw.sort(key=lambda item: item[:5])
+
+        for index, item in enumerate(raw, start=1):
+            _unreachable, moves, _y, _x, d, key, rec, path, error = item
+            cell = key[0]
+            reachable = error is None
+            shown_moves = (len(path) - 1) if reachable else None
+            options.append({
+                'id': f'E{index}',
+                'key': key,
+                'cell': tuple(cell),
+                'dir_index': int(d),
+                'dir': DIR_NAMES[d],
+                'reachable': reachable,
+                'moves': shown_moves,
+                'route_distance_m': (
+                    float(shown_moves) * CELL_LENGTH_M if reachable else 0.0
+                ),
+                'path': [tuple(c) for c in path],
+                'front_mm': rec.get('front_mm'),
+                'reason': rec.get('reason'),
+                'error': error,
+            })
+
+        return options
 
     def print_map_summary(self):
         print("\n================ DFS MAP SUMMARY ================")
@@ -5514,24 +7038,39 @@ class DFSMazeExplorer:
     # DFS
     # --------------------------------------------------------
 
-    def run_dfs(self):
-        self.visited = {self.root}
-        self.parent = {self.root: None}
-        self.current = self.root
+    def run_dfs(self, resume=False):
+        if not resume:
+            self.visited = {self.root}
+            self.parent = {self.root: None}
+            self.current = self.root
 
-        stack = [self.root]
+            stack = [self.root]
+        else:
+            # Continue from the cell just beyond an operator-approved
+            # EXIT_CANDIDATE without erasing the map learned so far.
+            stack = [self.current]
+
         exploration_finished = False
 
-        print("\n[DFS] START")
-        print(f"[DFS] root={self.root}, heading={DIR_NAMES[self.heading]}")
+        if not resume:
+            self.set_gui_status("EXPLORING MAZE", route=[self.current])
+            print("\n[DFS] START")
+            print(f"[DFS] root={self.root}, heading={DIR_NAMES[self.heading]}")
 
-        # Root is a launch/staging anchor. The robot is manually placed
-        # facing INTO the maze, so FRONT is the known ingress even when the
-        # staging area is completely open.
-        self.capture_start_anchor_profile()
+            # Root is a launch/staging anchor. The robot is manually placed
+            # facing INTO the maze, so FRONT is the known ingress even when the
+            # staging area is completely open.
+            self.capture_start_anchor_profile()
 
-        # The physical return side is still profiled independently.
-        self.capture_entrance_corridor_profile()
+            # The physical return side is still profiled independently.
+            self.capture_entrance_corridor_profile()
+        else:
+            self.set_gui_status("EXPLORING BEYOND APPROVED EXIT", route=[self.current])
+            print("\n[DFS] RESUME THROUGH APPROVED EXIT")
+            print(
+                f"[DFS] resume_cell={self.current}, "
+                f"heading={DIR_NAMES[self.heading]}"
+            )
 
         while self.running and stack:
             cell = stack[-1]
@@ -5550,7 +7089,14 @@ class DFSMazeExplorer:
                 # Last-resort containment. If an edge-level detector missed
                 # the boundary, do NOT let DFS choose another direction from
                 # an open outside area.
-                outside_evidence = self.detect_open_area_trap(cell)
+                if cell in self.approved_exit_entry_cells:
+                    outside_evidence = None
+                    print(
+                        f"[OPEN AREA TRAP] {cell} is the first cell beyond "
+                        "an operator-approved EXIT_CANDIDATE -> allow scan"
+                    )
+                else:
+                    outside_evidence = self.detect_open_area_trap(cell)
 
                 if outside_evidence is not None:
                     self.rollback_open_area_cell(
@@ -5881,6 +7427,7 @@ class DFSMazeExplorer:
             )
 
         self.map_complete = True
+        self.set_gui_status("CURRENT REGION FULLY EXPLORED")
 
         # Save the COMPLETED learned map before driving home.
         self.stop_chassis()
@@ -5896,6 +7443,34 @@ class DFSMazeExplorer:
 
         elif self.current == self.root:
             print("[RETURN HOME] DFS completed at root; no return trip needed.")
+
+        # ----------------------------------------------------
+        # OPERATOR DECISION AFTER RETURNING HOME
+        # ----------------------------------------------------
+        # Deferred exits are intentionally not crossed during the first pass.
+        # Once the robot is safely back at START, the operator can finish the
+        # mission or explicitly choose which deferred exit to continue through.
+        if self.running and self.current == self.root and self.exit_candidates:
+            decision = self.prompt_after_return_home()
+
+            if decision == "continue":
+                self.map_complete = False
+
+                if self.cross_selected_exit_candidate(
+                    self.operator_selected_exit_candidate
+                ):
+                    # Preserve all learned topology and continue DFS from the
+                    # newly reached cell beyond the approved candidate.
+                    self.run_dfs(resume=True)
+                    return
+
+                print(
+                    "[EXIT CONTINUE] unable to enter a candidate safely; "
+                    "mission ends at START."
+                )
+            else:
+                print("[MISSION] operator selected FINISH at START.")
+                self.set_gui_status("MISSION FINISHED AT START", route=[self.root])
 
 
 # ============================================================
@@ -5956,12 +7531,32 @@ def build_arg_parser():
         ),
     )
 
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help=(
+            "Disable Mission Control GUI and use terminal-only exit selection. "
+            "GUI is enabled by default."
+        ),
+    )
+
     return parser
 
 
 def main():
     args = build_arg_parser().parse_args()
     explorer = DFSMazeExplorer()
+    mission_gui = None
+
+    # GUI starts before robot connection so the operator sees connection/
+    # initialization state as part of the same mission dashboard.
+    if not args.no_gui:
+        mission_gui = MissionControlGUI(explorer)
+        if mission_gui.start():
+            explorer.attach_mission_gui(mission_gui)
+            explorer.set_gui_status('CONNECTING TO ROBOMASTER')
+        else:
+            mission_gui = None
 
     try:
         mode = args.mode
@@ -5982,22 +7577,37 @@ def main():
         # captured fresh during connect().
         if mode == "known":
             explorer.load_map(args.map_path)
+            explorer.set_gui_status('KNOWN MAP LOADED')
 
         explorer.connect()
 
         if mode == "explore":
             explorer.run_dfs()
         else:
+            explorer.set_gui_status('RUNNING KNOWN-MAP NAVIGATION')
             explorer.run_known_map(goal=args.goal)
 
     except KeyboardInterrupt:
         print("\n[STOP] Ctrl+C")
+        explorer.running = False
+        explorer.set_gui_status('STOPPED BY CTRL+C')
 
     except Exception as e:
         print(f"\n[ERROR] {type(e).__name__}: {e}")
+        explorer.set_gui_status(f'ERROR: {type(e).__name__}: {e}')
 
     finally:
         explorer.cleanup()
+
+        if mission_gui is not None and mission_gui.available:
+            # Keep the final map visible until the operator closes the window.
+            try:
+                mission_gui.post_mission_complete(explorer.build_gui_snapshot())
+                print('[GUI] Mission complete. Close Mission Control to exit.')
+                mission_gui.wait_closed()
+            except KeyboardInterrupt:
+                mission_gui.close()
+
 
 
 if __name__ == "__main__":
