@@ -8,6 +8,8 @@ import statistics
 import threading
 import time
 
+from robomaster import robot
+
 from config import *
 from src.core.geometry import wrap_deg, clamp, DIR_NAMES, DIR_VEC, neighbor
 

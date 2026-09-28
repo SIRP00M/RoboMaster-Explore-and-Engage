@@ -5,8 +5,9 @@
 
 import math
 import time
+from datetime import datetime
 
-from robomaster import blaster
+from robomaster import blaster as rm_blaster
 
 from config import *
 from src.core.geometry import wrap_deg
@@ -229,7 +230,7 @@ class BlasterMixin:
 
         try:
             ok = self.blaster.fire(
-                fire_type=blaster.INFRARED_FIRE,
+                fire_type=rm_blaster.INFRARED_FIRE,
                 times=max(1, int(TARGET_INFRARED_SHOTS)),
             )
             if ok is False:

@@ -15,7 +15,7 @@ except Exception:
     np = None
 
 from config import *
-from src.core.geometry import wrap_deg, clamp
+from src.core.geometry import wrap_deg, clamp, DIR_NAMES
 
 
 class VisionMixin:
