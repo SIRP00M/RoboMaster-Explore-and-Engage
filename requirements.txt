@@ -1,0 +1,17 @@
+# RoboMaster EP Autonomous Maze Exploration & Target Engagement
+# Core dependencies
+
+# DJI RoboMaster EP SDK
+robomaster>=0.1.1.68
+
+# Computer Vision & Image Processing
+opencv-python>=4.5.0
+numpy>=1.20.0,<2.0.0
+
+# Networking utilities required by RoboMaster SDK
+netifaces>=0.11.0
+netaddr>=1.3.0
+
+# Optional visualization / calibration utilities
+matplotlib>=3.3.0
+pillow>=8.0.0
