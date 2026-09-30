@@ -1,0 +1,18 @@
+{
+  "tof_pivot_offset_m": 0.168,
+  "tof_pivot_forward_m": -0.0005,
+  "sharp_left_offset_m": 0.1585,
+  "sharp_right_offset_m": 0.1585,
+  "measured_at": "2026-10-01T02:06:49",
+  "source": "python Test/calibrate_mounts.py (robot centred in a cell, walls left+right)",
+  "raw": {
+    "tof": {
+      "N": 0.156,
+      "E": 0.124,
+      "S": 0.155,
+      "W": 0.14
+    },
+    "sharp_left_m": 0.1474074074074074,
+    "sharp_right_m": 0.13567567567567568
+  }
+}

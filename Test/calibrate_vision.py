@@ -17,17 +17,24 @@ Efficient by default:
   - auto-picks the RoboMaster camera, falling back to a USB webcam if the
     robot isn't connected, so this also works as an indoor dry run
   - only the ACTIVE color's mask is computed per frame
+  - on the real robot, the gimbal is explicitly recentred to front on
+    connect (a stale angle left over from a previous script/session isn't
+    trusted), and 'n' drives straight backward by --step-cm on odometry so
+    the same target can be sampled at several distances without anyone
+    pushing the robot by hand
 
     python Test/calibrate_vision.py                    # RoboMaster camera, or webcam 0 if none
     python Test/calibrate_vision.py --source 0          # force webcam
     python Test/calibrate_vision.py --source photo.jpg  # a still image
     python Test/calibrate_vision.py --apply V16B.py      # also patch the file in place on save
+    python Test/calibrate_vision.py --step-cm 20         # 'n' backs up 20 cm at a time
 
 Controls
 --------
     1-4         select RED / YELLOW / GREEN / BLUE
     drag        sample a whole patch (5th-95th percentile HSV inside the box)
     click       sample a single point (small patch under the cursor)
+    n           back up --step-cm and keep going (RoboMaster source only)
     z           undo the last sample for the active color
     c           clear CLICKED samples for the active color (keeps the seed)
     x           clear the SEEDED range for the active color (keeps clicks)
@@ -42,8 +49,10 @@ import ast
 import json
 import re
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 try:
     import cv2
@@ -60,6 +69,28 @@ PATCH_RADIUS_DEFAULT = 5
 DRAG_MIN_PX = 6
 HUE_WRAP_SPLIT = 90.0
 VARNAME = "TARGET_HSV_RANGES"
+
+# Auto backup drive (RoboMaster source only) -- same approach as
+# Test/calibrate_tof.py's BackupDriver: absolute displacement from one
+# origin so repeated 'n' presses don't compound odometry error.
+POSITION_FREQ_HZ = 20
+ATTITUDE_FREQ_HZ = 20
+BACKUP_SPEED_MPS = 0.09
+BACKUP_SLOW_ZONE_M = 0.06
+BACKUP_MIN_SPEED_MPS = 0.03
+BACKUP_YAW_KP = 1.2
+BACKUP_YAW_MAX_DPS = 25.0
+BACKUP_ARRIVE_TOL_M = 0.01
+BACKUP_TIMEOUT_SEC = 15.0
+
+
+def wrap_deg(angle):
+    angle = float(angle)
+    while angle > 180.0:
+        angle -= 360.0
+    while angle <= -180.0:
+        angle += 360.0
+    return angle
 
 
 # ------------------------------------------------------------
@@ -110,15 +141,107 @@ class ImageSource:
         pass
 
 
+class BackupDriver:
+    """Drives straight backward on odometry, holding heading with the IMU.
+
+    Position is zeroed by the SDK at the moment sub_position() is called,
+    so subscribing right after connect makes THAT position the origin:
+    every 'n' press asks for an ABSOLUTE displacement from it (not chained
+    from the previous stop), so odometry error doesn't compound press to
+    press. Same design as Test/calibrate_tof.py's BackupDriver.
+    """
+
+    def __init__(self, ep_robot):
+        self._chassis = ep_robot.chassis
+        self._pos_lock = threading.Lock()
+        self._att_lock = threading.Lock()
+        self._x0: Optional[float] = None  # raw x at first sample -- our origin
+        self._x: Optional[float] = None
+        self._yaw: Optional[float] = None
+        self._chassis.sub_position(freq=POSITION_FREQ_HZ, callback=self._on_position)
+        self._chassis.sub_attitude(freq=ATTITUDE_FREQ_HZ, callback=self._on_attitude)
+        self.base_yaw = self._wait_for_yaw()
+
+    def _on_position(self, info):
+        # The SDK does NOT zero position at sub_position() time -- rebase
+        # to our own first sample (see the matching note in
+        # Test/calibrate_tof.py's BackupDriver).
+        if info:
+            x = float(info[0])
+            with self._pos_lock:
+                if self._x0 is None:
+                    self._x0 = x
+                self._x = x
+
+    def _on_attitude(self, info):
+        if info:
+            with self._att_lock:
+                self._yaw = float(info[0])
+
+    def _wait_for_yaw(self, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._att_lock:
+                if self._yaw is not None:
+                    return self._yaw
+            time.sleep(0.02)
+        return None
+
+    def traveled_back_m(self):
+        with self._pos_lock:
+            x, x0 = self._x, self._x0
+        return 0.0 if x is None or x0 is None else x0 - x
+
+    def back_up_to(self, target_total_m):
+        deadline = time.monotonic() + BACKUP_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            traveled = self.traveled_back_m()
+            remaining = target_total_m - traveled
+            if remaining <= BACKUP_ARRIVE_TOL_M:
+                break
+            speed = BACKUP_SPEED_MPS if remaining > BACKUP_SLOW_ZONE_M else max(
+                BACKUP_MIN_SPEED_MPS, BACKUP_SPEED_MPS * remaining / BACKUP_SLOW_ZONE_M
+            )
+            with self._att_lock:
+                yaw = self._yaw
+            z = 0.0
+            if yaw is not None and self.base_yaw is not None:
+                z = max(-BACKUP_YAW_MAX_DPS, min(BACKUP_YAW_MAX_DPS, BACKUP_YAW_KP * wrap_deg(self.base_yaw - yaw)))
+            self._chassis.drive_speed(x=-speed, y=0.0, z=z, timeout=0.3)
+            time.sleep(0.04)
+        self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
+        time.sleep(0.15)
+        return self.traveled_back_m()
+
+    def close(self):
+        try:
+            self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
+        except Exception:
+            pass
+        try:
+            self._chassis.unsub_position()
+        except Exception:
+            pass
+        try:
+            self._chassis.unsub_attitude()
+        except Exception:
+            pass
+
+
 class RoboMasterSource:
     def __init__(self, conn_type="ap"):
         from robomaster import robot, camera as rm_camera
 
         self.ep_robot = robot.Robot()
         self.ep_robot.initialize(conn_type=conn_type)
+        # Don't trust whatever angle the gimbal was left at by a previous
+        # script/session -- always start the camera pointed at a known front.
+        self.ep_robot.gimbal.recenter().wait_for_completed()
         self.camera = self.ep_robot.camera
         resolution = getattr(rm_camera, "STREAM_360P", "360p")
         self.camera.start_video_stream(display=False, resolution=resolution)
+        self.backup = BackupDriver(self.ep_robot)
+        self.backed_up_m = 0.0
 
     def read(self):
         try:
@@ -126,7 +249,15 @@ class RoboMasterSource:
         except Exception:
             return None
 
+    def back_up_step(self, step_m):
+        self.backed_up_m += step_m
+        return self.backup.back_up_to(self.backed_up_m)
+
     def release(self):
+        try:
+            self.backup.close()
+        except Exception:
+            pass
         try:
             self.camera.stop_video_stream()
         finally:
@@ -275,9 +406,25 @@ def _bounds(samples, h_margin, s_margin, v_margin):
 
 
 def merge_ranges(ranges):
-    """Union a mixed bag of (lo, hi) tuples, keeping the low/high hue-wrap buckets separate."""
+    """Union a mixed bag of (lo, hi) tuples into as few ranges as possible.
+
+    Only actually splits into two hue-wrap buckets when the ranges look
+    like a real 0/179 wraparound (something near 0 AND something near
+    179) -- not just "some hue below 90, some above", which is normal
+    for an ordinary color like BLUE (~88-138) and previously got it cut
+    in half at the HUE_WRAP_SPLIT line into two needlessly separate
+    (and for BLUE, one fully redundant) ranges.
+    """
     if not ranges:
         return []
+    near_zero = any(r[0][0] <= 15 for r in ranges)
+    near_top = any(r[1][0] >= 165 for r in ranges)
+    if not (near_zero and near_top):
+        los, his = [r[0] for r in ranges], [r[1] for r in ranges]
+        lo = tuple(int(min(v[i] for v in los)) for i in range(3))
+        hi = tuple(int(max(v[i] for v in his)) for i in range(3))
+        return [(lo, hi)]
+
     low_bucket = [r for r in ranges if r[0][0] < HUE_WRAP_SPLIT]
     high_bucket = [r for r in ranges if r[0][0] >= HUE_WRAP_SPLIT]
     out = []
@@ -301,7 +448,7 @@ def build_mask(hsv_frame, ranges):
     return mask
 
 
-def draw_hud(frame, calib, coverage_pct):
+def draw_hud(frame, calib, coverage_pct, backed_up_m=None):
     y = 20
     for name in calib.colors:
         n = len(calib.samples[name])
@@ -311,6 +458,11 @@ def draw_hud(frame, calib, coverage_pct):
         if ranges:
             text += " " + " ".join(f"{lo}-{hi}" for lo, hi in ranges)
         cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_BGR[name], 1, cv2.LINE_AA)
+        y += 16
+
+    if backed_up_m is not None:
+        cv2.putText(frame, f"backed up {backed_up_m * 100.0:.0f} cm ('n' for more)",
+                    (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
         y += 16
 
     if calib.hover_hsv is not None:
@@ -370,6 +522,7 @@ def main():
     ap.add_argument("--no-seed", action="store_true", help="start with empty ranges instead of seeding from --seed-from")
     ap.add_argument("--apply", default=None, help="also patch this file's TARGET_HSV_RANGES in place on save")
     ap.add_argument("--out", default="calibration/vision_hsv.json")
+    ap.add_argument("--step-cm", type=float, default=30.0, help="how far 'n' backs up each press (RoboMaster source only)")
     args = ap.parse_args()
 
     seed = {}
@@ -414,8 +567,13 @@ def main():
 
     cv2.namedWindow(WINDOW)
     cv2.setMouseCallback(WINDOW, on_mouse)
+    has_backup = hasattr(source, "back_up_step")
     print("HSV Calibrator ready. 1-4=color  drag/click=sample  z=undo  c=clear-clicks  "
-          "x=clear-seed  r=clear-all  p=preview  s=save  q=quit")
+          "x=clear-seed  r=clear-all  p=preview  s=save  q=quit"
+          + (f"  n=back-up-{args.step_cm:.0f}cm" if has_backup else ""))
+    if has_backup:
+        print(f"[BACKUP] 'n' drives the robot straight back {args.step_cm:.0f} cm each press "
+              f"(on odometry, heading held) -- make sure the space behind it is clear.")
 
     try:
         while True:
@@ -432,7 +590,7 @@ def main():
             coverage_pct = 100.0 * cv2.countNonZero(mask) / mask.size
 
             display = frame.copy()
-            draw_hud(display, calib, coverage_pct)
+            draw_hud(display, calib, coverage_pct, backed_up_m=source.backed_up_m if has_backup else None)
             if drag_start[0] is not None and drag_now[0] is not None:
                 cv2.rectangle(display, drag_start[0], drag_now[0], COLOR_BGR[calib.active], 1)
 
@@ -461,6 +619,9 @@ def main():
                 preview_mode = (preview_mode + 1) % 3
             elif key == ord("s"):
                 save(calib, args.out, args.apply)
+            elif key == ord("n") and has_backup:
+                traveled_m = source.back_up_step(args.step_cm / 100.0)
+                print(f"[BACKUP] now {traveled_m * 100.0:.1f} cm from the start position")
     finally:
         source.release()
         cv2.destroyAllWindows()

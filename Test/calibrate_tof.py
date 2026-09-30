@@ -12,18 +12,23 @@ maze cell with walls on its LEFT, RIGHT and FRONT, square to them. Left-raw
 + right-raw always sums to one cell width regardless of exactly where the
 robot sits across the cell, so that fixes the ToF's own offset at short
 range and, with it, the true distance to the wall ahead -- point 1, no
-ruler. The robot then backs itself up on odometry (chassis position +
-attitude, holding heading straight) through the rest of --distances,
-re-reading the ToF at each stop; the true distance used is where it
-REALLY stopped (odometry), not the nominal target. This mirrors
-calibrate_tof.py in the sibling maze-runner project (tools/calibrate_tof.py),
-adapted to drive directly on the RoboMaster SDK instead of that project's
-own motion stack.
+ruler. From there it's interactive and grid-quantized, since the maze's
+own cells are already a known ruler: press 'n' and the robot backs up one
+full grid cell (--cell-size, 0.60 m by default) on odometry (holding
+heading straight with the IMU) and records a ToF point there -- true
+distance is always point-1's distance plus however many grid cells back,
+no separate measuring step. This mirrors calibrate_tof.py in the sibling
+maze-runner project (tools/calibrate_tof.py), adapted to drive directly on
+the RoboMaster SDK and to step by grid cell instead of a preset list.
 
-    python Test/calibrate_tof.py                          # auto point 1 + self-driving backup
-    python Test/calibrate_tof.py --distances 40 60 90 120  # only these (cm) after point 1
-    python Test/calibrate_tof.py --manual                  # place the wall by hand for every point
-    python Test/calibrate_tof.py --max 90                  # only 0.6 m clear behind it
+    python Test/calibrate_tof.py                # auto point 1, then 'n' to step back a grid cell
+    python Test/calibrate_tof.py --cell-size 0.5 # a different maze cell size
+    python Test/calibrate_tof.py --manual        # place the wall by hand for every point instead
+    python Test/calibrate_tof.py --manual --distances 40 60 90 120
+
+Interactive (auto) controls: n=back up one grid cell & record it, z=undo
+the last point (and re-arm that grid step for a retry), s=save without
+quitting, q=save & quit.
 
 Manual mode (or the automatic fallback when there are no side walls to
 find point 1 from): R=record/re-record N samples, Enter=accept & next,
@@ -144,6 +149,7 @@ class BackupDriver:
         self._chassis = ep_robot.chassis
         self._pos_lock = threading.Lock()
         self._att_lock = threading.Lock()
+        self._x0: Optional[float] = None  # raw x at first sample -- our origin
         self._x: Optional[float] = None
         self._yaw: Optional[float] = None
         self._chassis.sub_position(freq=POSITION_FREQ_HZ, callback=self._on_position)
@@ -151,9 +157,19 @@ class BackupDriver:
         self.base_yaw = self._wait_for_yaw()
 
     def _on_position(self, info) -> None:
+        # The SDK does NOT zero position at sub_position() time -- it's
+        # whatever the chassis has accumulated since power-on/last reset
+        # (same reason V16B.py's own position_callback rebases to its
+        # first sample). Skipping this made traveled_back_m() measure
+        # against a leftover offset instead of "since now", so the robot
+        # could drive well past the intended distance before its own
+        # (wrong) idea of "remaining" reached zero.
         if info and len(info) >= 1:
+            x = float(info[0])
             with self._pos_lock:
-                self._x = float(info[0])
+                if self._x0 is None:
+                    self._x0 = x
+                self._x = x
 
     def _on_attitude(self, info) -> None:
         if info and len(info) >= 1:
@@ -171,8 +187,8 @@ class BackupDriver:
 
     def traveled_back_m(self) -> float:
         with self._pos_lock:
-            x = self._x
-        return 0.0 if x is None else -x
+            x, x0 = self._x, self._x0
+        return 0.0 if x is None or x0 is None else x0 - x
 
     def back_up_to(self, target_total_m: float) -> Optional[float]:
         """Drive until traveled_back_m() reaches target_total_m (absolute,
@@ -243,33 +259,55 @@ def auto_first_point(ep_robot, reader: ToFReader, pitch_deg: float, samples: int
     return front, true_mm
 
 
-def auto_collect(
+def interactive_grid_collect(
     ep_robot, reader: ToFReader, pitch_deg: float, samples: int,
-    start_true_cm: float, distances_cm: List[float], points: Dict[float, float],
+    start_true_cm: float, cell_size_m: float, points: Dict[float, float],
+    save_fn,
 ) -> None:
-    """Self-driving backup: fills ``points`` for every distance > start_true_cm."""
-    targets = [d for d in distances_cm if d > start_true_cm + 2.0]
-    if not targets:
-        return
+    """'n' backs up one grid cell and records a point there; 'z' undoes the
+    last one (and re-arms that grid step so 'n' re-measures the same spot);
+    's' saves without quitting; 'q' saves and returns.
 
-    span_m = (max(targets) - start_true_cm) / 100.0
-    print(f"\nIt will back up about {span_m:.2f} m from here: keep that much clear behind it.")
-    input("Press Enter to start the self-driving backup (Ctrl+C to abort)...")
+    True distance for step k is always start_true_cm + k * cell_size_m --
+    the maze's own cells are the ruler, so no separate measuring is needed.
+    """
+    span_m = cell_size_m  # printed as a per-press reminder, not a hard cap
+    print(f"\nGrid step = {cell_size_m * 100.0:.0f} cm. Each 'n' backs up one cell "
+          f"({span_m * 100.0:.0f} cm) -- make sure that's clear behind it.")
+    print("n=back up one grid cell & record   z=undo last (re-arm)   s=save   q=save & quit")
 
     driver = BackupDriver(ep_robot)
+    step = 0
     try:
-        for true_cm in targets:
-            target_total_m = (true_cm - start_true_cm) / 100.0
-            traveled_m = driver.back_up_to(target_total_m)
-            real_true_cm = start_true_cm + (traveled_m or 0.0) * 100.0
-            ep_robot.gimbal.moveto(pitch=pitch_deg, yaw=0.0, pitch_speed=60, yaw_speed=90).wait_for_completed()
-            raw = reader.median(samples)
-            if raw is None:
-                print(f"  {real_true_cm:.1f} cm: no fresh ToF reading -- skipped")
-                continue
-            print(f"  {real_true_cm:.1f} cm (target {true_cm:.1f}): raw = {raw:.1f} mm "
-                  f"(shift {real_true_cm * 10.0 - raw:+.1f})")
-            points[round(real_true_cm, 2)] = raw
+        while True:
+            key = read_key()
+            if key == "N":
+                step += 1
+                target_total_m = step * cell_size_m
+                traveled_m = driver.back_up_to(target_total_m)
+                real_true_cm = start_true_cm + (traveled_m or 0.0) * 100.0
+                ep_robot.gimbal.moveto(pitch=pitch_deg, yaw=0.0, pitch_speed=60, yaw_speed=90).wait_for_completed()
+                raw = reader.median(samples)
+                if raw is None:
+                    print(f"  step {step} (~{real_true_cm:.1f} cm): no fresh ToF reading -- not recorded, "
+                          f"press 'n' again to retry from here")
+                    step -= 1
+                    continue
+                print(f"  step {step}: {real_true_cm:.1f} cm  raw={raw:.1f} mm  "
+                      f"(shift {real_true_cm * 10.0 - raw:+.1f})")
+                points[round(real_true_cm, 2)] = raw
+            elif key == "Z":
+                if points and len(points) > 1:  # never undo point 1
+                    dropped = max(points)
+                    del points[dropped]
+                    step = max(0, step - 1)
+                    print(f"  undid {dropped:.1f} cm -- press 'n' to re-measure that grid step")
+                else:
+                    print("  nothing to undo")
+            elif key == "S":
+                save_fn(points)
+            elif key == "Q":
+                break
     finally:
         driver.close()
 
@@ -312,7 +350,41 @@ def build_table(points: Dict[float, float]) -> List[Tuple[float, float]]:
     table = sorted(set(pairs))
     if len(table) < 2:
         raise ValueError("need at least two distinct calibration points")
+
+    bad = [(r2, d2) for (r1, d1), (r2, d2) in zip(table, table[1:]) if d2 <= d1]
+    if bad:
+        print("[WARN] true distance should only ever INCREASE as raw reading increases; "
+              "it didn't at:")
+        for r, d in bad:
+            print(f"         raw={r:.1f} mm  true={d:.1f} mm")
+        print("       Something likely went wrong physically around there (robot moved by")
+        print("       hand, hit something, wheel slip). Consider dropping those points and")
+        print("       re-measuring that range before trusting this table.")
     return table
+
+
+def save_points(points: Dict[float, float], out_path: str, source_label: str) -> bool:
+    if len(points) < 2:
+        print(f"\n[SAVE] only {len(points)} point(s) so far; need >= 2 to build a table -- keep collecting")
+        return False
+
+    table = build_table(points)
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "points": [{"raw_mm": r, "true_mm": d} for r, d in table],
+        "source": source_label,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }, indent=2))
+
+    snippet = format_snippet(table)
+    snippet_path = path.with_suffix(".py")
+    snippet_path.write_text(snippet + "\n")
+
+    print(f"\n[SAVE] {len(table)} points -> {path} and {snippet_path}")
+    print("Paste into V16B.py next to LEFT_CAL/RIGHT_CAL:\n")
+    print(snippet)
+    return True
 
 
 def format_snippet(table: List[Tuple[float, float]]) -> str:
@@ -340,12 +412,13 @@ def format_snippet(table: List[Tuple[float, float]]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--conn-type", default="ap", choices=("ap", "sta", "rndis"))
+    ap.add_argument("--cell-size", type=float, default=CELL_SIZE_M, help="maze grid cell size in metres (auto mode step)")
     ap.add_argument("--distances", type=float, nargs="+", default=list(DEFAULT_DISTANCES_CM),
-                     help="true distances in cm to add AFTER the auto/first point")
+                     help="--manual only: true distances in cm to place the wall at")
     ap.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
     ap.add_argument("--pitch", type=float, default=DEFAULT_PITCH_DEG)
     ap.add_argument("--manual", action="store_true", help="place the wall by hand for every point (no self-driving)")
-    ap.add_argument("--max", type=float, default=None, help="drop distances beyond this cm (little room behind it)")
+    ap.add_argument("--max", type=float, default=None, help="--manual only: drop distances beyond this cm")
     ap.add_argument("--out", default="calibration/tof.json")
     args = ap.parse_args()
 
@@ -353,19 +426,20 @@ def main() -> int:
         raise RuntimeError("RoboMaster SDK not found in the active Python environment")
 
     points: Dict[float, float] = {}
-    distances = sorted(d for d in args.distances if args.max is None or d <= args.max + 1e-9)
+    source_label = "python Test/calibrate_tof.py" + (" --manual" if args.manual else "")
 
     print("=" * 68)
     print(" ToF RAW-VS-TRUE DISTANCE CALIBRATION")
     print("=" * 68)
     if args.manual:
+        distances = sorted(d for d in args.distances if args.max is None or d <= args.max + 1e-9)
         print(f"Place a wall at each of {distances} cm from the gimbal by hand.")
+        print("R=record | Enter=accept/next | Q=save & quit")
     else:
         print("Stand the robot centred in a cell with walls LEFT, RIGHT and FRONT,")
-        print("square to them: point 1 comes from those walls, then it backs itself")
-        print(f"up through {distances} cm on odometry. Falls back to manual placement")
-        print("if there are no side walls to find point 1 from.")
-    print("R=record | Enter=accept/next | Q=save & quit  (manual points only)")
+        print("square to them: point 1 comes from those walls, then 'n' backs it up")
+        print(f"one grid cell ({args.cell_size * 100.0:.0f} cm) at a time, recording as it goes.")
+        print("Falls back to manual placement if there are no side walls for point 1.")
     print("=" * 68)
 
     ep_robot = robot.Robot()
@@ -390,12 +464,12 @@ def main() -> int:
         ep_robot.gimbal.moveto(pitch=args.pitch, yaw=0.0, pitch_speed=60, yaw_speed=90).wait_for_completed()
 
         if start_true_cm is not None:
-            auto_collect(ep_robot, reader, args.pitch, args.samples, start_true_cm, distances, points)
-            remaining = [d for d in distances if d not in points and d <= start_true_cm + 2.0]
-            if remaining:
-                print(f"\n{remaining} cm (at/before point 1) still need manual placement:")
-                collect(reader, remaining, args.samples, points)
+            interactive_grid_collect(
+                ep_robot, reader, args.pitch, args.samples, start_true_cm, args.cell_size, points,
+                save_fn=lambda pts: save_points(pts, args.out, source_label),
+            )
         else:
+            distances = sorted(d for d in args.distances if args.max is None or d <= args.max + 1e-9)
             collect(reader, distances, args.samples, points)
     except KeyboardInterrupt:
         print("\n[CTRL+C] saving progress...")
@@ -407,26 +481,11 @@ def main() -> int:
         except Exception:
             pass
 
-    if len(points) < 2:
-        print(f"\nOnly {len(points)} point(s) accepted; need >= 2. Nothing saved.")
+    # The interactive (auto) path already saves on 's'/'q'; this is the
+    # single save for the manual/fallback path (and a final safety net if
+    # auto mode was interrupted before a 'q').
+    if not save_points(points, args.out, source_label):
         return 1
-
-    table = build_table(points)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({
-        "points": [{"raw_mm": r, "true_mm": d} for r, d in table],
-        "source": "python Test/calibrate_tof.py" + (" --manual" if args.manual else ""),
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    }, indent=2))
-
-    snippet = format_snippet(table)
-    snippet_path = out_path.with_suffix(".py")
-    snippet_path.write_text(snippet + "\n")
-
-    print(f"\nSaved {len(table)} points to {out_path}")
-    print(f"Snippet written to {snippet_path} -- paste into V16B.py next to LEFT_CAL/RIGHT_CAL:\n")
-    print(snippet)
     return 0
 
 

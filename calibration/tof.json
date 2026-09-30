@@ -1,0 +1,18 @@
+{
+  "points": [
+    {
+      "raw_mm": 125.0,
+      "true_mm": 286.5
+    },
+    {
+      "raw_mm": 837.0,
+      "true_mm": 880.0
+    },
+    {
+      "raw_mm": 1481.0,
+      "true_mm": 1479.8
+    }
+  ],
+  "source": "python Test/calibrate_tof.py (points 4-6 dropped: non-monotonic, see commit message)",
+  "saved_at": "2026-10-01T02:53:49"
+}
