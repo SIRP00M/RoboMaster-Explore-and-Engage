@@ -49,16 +49,16 @@ import ast
 import json
 import re
 import sys
-import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 try:
     import cv2
     import numpy as np
 except ImportError as exc:
     sys.exit(f"calibrate_vision requires opencv-python and numpy: {exc}")
+
+from backup_driver import BackupDriver
 
 COLOR_NAMES = ["RED", "YELLOW", "GREEN", "BLUE"]
 COLOR_KEYS = {ord("1"): "RED", ord("2"): "YELLOW", ord("3"): "GREEN", ord("4"): "BLUE"}
@@ -69,28 +69,6 @@ PATCH_RADIUS_DEFAULT = 5
 DRAG_MIN_PX = 6
 HUE_WRAP_SPLIT = 90.0
 VARNAME = "TARGET_HSV_RANGES"
-
-# Auto backup drive (RoboMaster source only) -- same approach as
-# Test/calibrate_tof.py's BackupDriver: absolute displacement from one
-# origin so repeated 'n' presses don't compound odometry error.
-POSITION_FREQ_HZ = 20
-ATTITUDE_FREQ_HZ = 20
-BACKUP_SPEED_MPS = 0.09
-BACKUP_SLOW_ZONE_M = 0.06
-BACKUP_MIN_SPEED_MPS = 0.03
-BACKUP_YAW_KP = 1.2
-BACKUP_YAW_MAX_DPS = 25.0
-BACKUP_ARRIVE_TOL_M = 0.01
-BACKUP_TIMEOUT_SEC = 15.0
-
-
-def wrap_deg(angle):
-    angle = float(angle)
-    while angle > 180.0:
-        angle -= 360.0
-    while angle <= -180.0:
-        angle += 360.0
-    return angle
 
 
 # ------------------------------------------------------------
@@ -139,93 +117,6 @@ class ImageSource:
 
     def release(self):
         pass
-
-
-class BackupDriver:
-    """Drives straight backward on odometry, holding heading with the IMU.
-
-    Position is zeroed by the SDK at the moment sub_position() is called,
-    so subscribing right after connect makes THAT position the origin:
-    every 'n' press asks for an ABSOLUTE displacement from it (not chained
-    from the previous stop), so odometry error doesn't compound press to
-    press. Same design as Test/calibrate_tof.py's BackupDriver.
-    """
-
-    def __init__(self, ep_robot):
-        self._chassis = ep_robot.chassis
-        self._pos_lock = threading.Lock()
-        self._att_lock = threading.Lock()
-        self._x0: Optional[float] = None  # raw x at first sample -- our origin
-        self._x: Optional[float] = None
-        self._yaw: Optional[float] = None
-        self._chassis.sub_position(freq=POSITION_FREQ_HZ, callback=self._on_position)
-        self._chassis.sub_attitude(freq=ATTITUDE_FREQ_HZ, callback=self._on_attitude)
-        self.base_yaw = self._wait_for_yaw()
-
-    def _on_position(self, info):
-        # The SDK does NOT zero position at sub_position() time -- rebase
-        # to our own first sample (see the matching note in
-        # Test/calibrate_tof.py's BackupDriver).
-        if info:
-            x = float(info[0])
-            with self._pos_lock:
-                if self._x0 is None:
-                    self._x0 = x
-                self._x = x
-
-    def _on_attitude(self, info):
-        if info:
-            with self._att_lock:
-                self._yaw = float(info[0])
-
-    def _wait_for_yaw(self, timeout=2.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            with self._att_lock:
-                if self._yaw is not None:
-                    return self._yaw
-            time.sleep(0.02)
-        return None
-
-    def traveled_back_m(self):
-        with self._pos_lock:
-            x, x0 = self._x, self._x0
-        return 0.0 if x is None or x0 is None else x0 - x
-
-    def back_up_to(self, target_total_m):
-        deadline = time.monotonic() + BACKUP_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            traveled = self.traveled_back_m()
-            remaining = target_total_m - traveled
-            if remaining <= BACKUP_ARRIVE_TOL_M:
-                break
-            speed = BACKUP_SPEED_MPS if remaining > BACKUP_SLOW_ZONE_M else max(
-                BACKUP_MIN_SPEED_MPS, BACKUP_SPEED_MPS * remaining / BACKUP_SLOW_ZONE_M
-            )
-            with self._att_lock:
-                yaw = self._yaw
-            z = 0.0
-            if yaw is not None and self.base_yaw is not None:
-                z = max(-BACKUP_YAW_MAX_DPS, min(BACKUP_YAW_MAX_DPS, BACKUP_YAW_KP * wrap_deg(self.base_yaw - yaw)))
-            self._chassis.drive_speed(x=-speed, y=0.0, z=z, timeout=0.3)
-            time.sleep(0.04)
-        self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
-        time.sleep(0.15)
-        return self.traveled_back_m()
-
-    def close(self):
-        try:
-            self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
-        except Exception:
-            pass
-        try:
-            self._chassis.unsub_position()
-        except Exception:
-            pass
-        try:
-            self._chassis.unsub_attitude()
-        except Exception:
-            pass
 
 
 class RoboMasterSource:

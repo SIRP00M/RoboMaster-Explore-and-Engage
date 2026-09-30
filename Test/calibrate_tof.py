@@ -51,6 +51,8 @@ try:
 except ModuleNotFoundError:
     robot = None
 
+from backup_driver import BackupDriver
+
 CELL_SIZE_M = 0.60  # matches GRID_TILE_M in V16B.py
 DEFAULT_DISTANCES_CM = (40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 120.0, 150.0)
 DEFAULT_SAMPLES = 40
@@ -59,26 +61,6 @@ TOF_FREQ_HZ = 20
 VALID_MIN_MM = 20.0
 VALID_MAX_MM = 4000.0
 SIDE_WALL_MAX_FRAC = 0.75  # a side reading beyond this fraction of a cell isn't "the wall"
-
-# Auto backup drive.
-POSITION_FREQ_HZ = 20
-ATTITUDE_FREQ_HZ = 20
-BACKUP_SPEED_MPS = 0.09
-BACKUP_SLOW_ZONE_M = 0.06
-BACKUP_MIN_SPEED_MPS = 0.03
-BACKUP_YAW_KP = 1.2
-BACKUP_YAW_MAX_DPS = 25.0
-BACKUP_ARRIVE_TOL_M = 0.01
-BACKUP_TIMEOUT_SEC = 15.0
-
-
-def wrap_deg(angle: float) -> float:
-    angle = float(angle)
-    while angle > 180.0:
-        angle -= 360.0
-    while angle <= -180.0:
-        angle += 360.0
-    return angle
 
 
 def read_key() -> str:
@@ -135,108 +117,16 @@ class ToFReader:
             pass
 
 
-class BackupDriver:
-    """Drives straight backward on odometry, holding heading with the IMU.
-
-    Position is zeroed by the SDK at the moment sub_position() is called,
-    so subscribing right after point 1 makes that position the origin: all
-    later targets are driven to as an ABSOLUTE displacement from it (not
-    chained from the previous stop), so odometry error doesn't compound
-    hop to hop -- same principle as the sibling project's back_up().
-    """
-
-    def __init__(self, ep_robot):
-        self._chassis = ep_robot.chassis
-        self._pos_lock = threading.Lock()
-        self._att_lock = threading.Lock()
-        self._x0: Optional[float] = None  # raw x at first sample -- our origin
-        self._x: Optional[float] = None
-        self._yaw: Optional[float] = None
-        self._chassis.sub_position(freq=POSITION_FREQ_HZ, callback=self._on_position)
-        self._chassis.sub_attitude(freq=ATTITUDE_FREQ_HZ, callback=self._on_attitude)
-        self.base_yaw = self._wait_for_yaw()
-
-    def _on_position(self, info) -> None:
-        # The SDK does NOT zero position at sub_position() time -- it's
-        # whatever the chassis has accumulated since power-on/last reset
-        # (same reason V16B.py's own position_callback rebases to its
-        # first sample). Skipping this made traveled_back_m() measure
-        # against a leftover offset instead of "since now", so the robot
-        # could drive well past the intended distance before its own
-        # (wrong) idea of "remaining" reached zero.
-        if info and len(info) >= 1:
-            x = float(info[0])
-            with self._pos_lock:
-                if self._x0 is None:
-                    self._x0 = x
-                self._x = x
-
-    def _on_attitude(self, info) -> None:
-        if info and len(info) >= 1:
-            with self._att_lock:
-                self._yaw = float(info[0])
-
-    def _wait_for_yaw(self, timeout: float = 2.0) -> Optional[float]:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            with self._att_lock:
-                if self._yaw is not None:
-                    return self._yaw
-            time.sleep(0.02)
-        return None
-
-    def traveled_back_m(self) -> float:
-        with self._pos_lock:
-            x, x0 = self._x, self._x0
-        return 0.0 if x is None or x0 is None else x0 - x
-
-    def back_up_to(self, target_total_m: float) -> Optional[float]:
-        """Drive until traveled_back_m() reaches target_total_m (absolute,
-        from this driver's origin). Returns the real traveled distance."""
-        deadline = time.monotonic() + BACKUP_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            traveled = self.traveled_back_m()
-            remaining = target_total_m - traveled
-            if remaining <= BACKUP_ARRIVE_TOL_M:
-                break
-            speed = BACKUP_SPEED_MPS if remaining > BACKUP_SLOW_ZONE_M else max(
-                BACKUP_MIN_SPEED_MPS, BACKUP_SPEED_MPS * remaining / BACKUP_SLOW_ZONE_M
-            )
-            with self._att_lock:
-                yaw = self._yaw
-            z = 0.0
-            if yaw is not None and self.base_yaw is not None:
-                err = wrap_deg(self.base_yaw - yaw)
-                z = max(-BACKUP_YAW_MAX_DPS, min(BACKUP_YAW_MAX_DPS, BACKUP_YAW_KP * err))
-            self._chassis.drive_speed(x=-speed, y=0.0, z=z, timeout=0.3)
-            time.sleep(0.04)
-        self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
-        time.sleep(0.15)
-        return self.traveled_back_m()
-
-    def close(self) -> None:
-        try:
-            self._chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.3)
-        except Exception:
-            pass
-        try:
-            self._chassis.unsub_position()
-        except Exception:
-            pass
-        try:
-            self._chassis.unsub_attitude()
-        except Exception:
-            pass
-
-
-def auto_first_point(ep_robot, reader: ToFReader, pitch_deg: float, samples: int) -> Optional[Tuple[float, float]]:
+def auto_first_point(
+    ep_robot, reader: ToFReader, pitch_deg: float, samples: int, cell_size_m: float = CELL_SIZE_M,
+) -> Optional[Tuple[float, float]]:
     """(raw_mm, true_mm) for the wall dead ahead, found from the side walls.
 
     Returns None if there are no usable walls on both sides (open floor,
     doorway, etc.) -- caller should fall back to fully manual placement.
     """
     gimbal = ep_robot.gimbal
-    limit_mm = CELL_SIZE_M * 1000.0 * SIDE_WALL_MAX_FRAC
+    limit_mm = cell_size_m * 1000.0 * SIDE_WALL_MAX_FRAC
 
     gimbal.moveto(pitch=pitch_deg, yaw=-90.0, pitch_speed=60, yaw_speed=90).wait_for_completed()
     left = reader.median(samples)
@@ -247,7 +137,7 @@ def auto_first_point(ep_robot, reader: ToFReader, pitch_deg: float, samples: int
     if left is None or right is None or left > limit_mm or right > limit_mm:
         return None
 
-    offset_mm = (CELL_SIZE_M * 1000.0 - (left + right)) / 2.0
+    offset_mm = (cell_size_m * 1000.0 - (left + right)) / 2.0
     front = reader.median(samples)
     if front is None:
         return None
@@ -307,6 +197,7 @@ def interactive_grid_collect(
             elif key == "S":
                 save_fn(points)
             elif key == "Q":
+                save_fn(points)
                 break
     finally:
         driver.close()
@@ -444,6 +335,7 @@ def main() -> int:
 
     ep_robot = robot.Robot()
     reader = None
+    already_saved = False
     try:
         print(f"\n[CONNECT] conn_type='{args.conn_type}' ...")
         ep_robot.initialize(conn_type=args.conn_type)
@@ -453,7 +345,7 @@ def main() -> int:
 
         start_true_cm = None
         if not args.manual:
-            found = auto_first_point(ep_robot, reader, args.pitch, args.samples)
+            found = auto_first_point(ep_robot, reader, args.pitch, args.samples, cell_size_m=args.cell_size)
             if found is not None:
                 raw, true_mm = found
                 start_true_cm = round(true_mm / 10.0, 2)
@@ -468,6 +360,7 @@ def main() -> int:
                 ep_robot, reader, args.pitch, args.samples, start_true_cm, args.cell_size, points,
                 save_fn=lambda pts: save_points(pts, args.out, source_label),
             )
+            already_saved = True  # interactive_grid_collect() only returns via its own 'q' save
         else:
             distances = sorted(d for d in args.distances if args.max is None or d <= args.max + 1e-9)
             collect(reader, distances, args.samples, points)
@@ -481,9 +374,11 @@ def main() -> int:
         except Exception:
             pass
 
-    # The interactive (auto) path already saves on 's'/'q'; this is the
-    # single save for the manual/fallback path (and a final safety net if
-    # auto mode was interrupted before a 'q').
+    # Manual/fallback path, or an auto-mode Ctrl+C before it reached its own
+    # 'q' save, still need a save here; the normal interactive 'q' path does
+    # not, to avoid printing the same save twice.
+    if already_saved:
+        return 0
     if not save_points(points, args.out, source_label):
         return 1
     return 0
