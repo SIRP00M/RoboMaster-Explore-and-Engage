@@ -401,6 +401,34 @@ TOF_SCAN_TIMEOUT_SEC = 1.20
 TOF_VALID_MIN_MM = 20.0
 TOF_VALID_MAX_MM = 10000.0
 
+# ------------------------------------------------------------
+# WALL-HEADING CORRECTION
+# ------------------------------------------------------------
+# Ported from the double-ToF-probe technique in the sibling
+# Robomaster-Conquer-the-Unknown-World project (slam/perception.py:
+# heading_from_wall + slam/explorer.py: _heading_from_walls).
+#
+# The turn controller above closes the loop purely on chassis attitude
+# (current_yaw(), fed by sub_attitude/IMU integration). Nothing corrects
+# that estimate against the physical maze, so a small per-turn IMU error
+# compounds over a run even though each individual turn looks "settled".
+#
+# Two ToF hits on the SAME wall, WALL_HEADING_PROBE_DEG of gimbal yaw
+# apart, give that wall's true angle in the chassis BODY frame -- using
+# only the gimbal's own (short-term accurate) relative yaw, not the
+# chassis IMU. Since a maze wall must run parallel to a grid axis, that
+# angle fixes the chassis's true absolute yaw, independent of however
+# much the IMU has drifted. Comparing it against current_yaw() gives a
+# small, gated correction applied to base_yaw_deg (and the live
+# yaw_ref_deg) instead of trusting gyro integration forever.
+WALL_HEADING_ENABLED = True
+WALL_HEADING_PROBE_DEG = 15.0
+WALL_HEADING_MIN_RANGE_MM = 120.0
+WALL_HEADING_MAX_RANGE_MM = 450.0
+WALL_HEADING_MIN_VECTOR_M = 0.03
+WALL_HEADING_GATE_DEG = 12.0
+WALL_HEADING_MAX_STEP_DEG = 6.0
+
 STARTUP_CONNECT_RETRIES = 3
 STARTUP_TELEMETRY_WAIT_SEC = 5.0
 STARTUP_GIMBAL_WAIT_SEC = 2.5
@@ -4353,6 +4381,7 @@ class DFSMapOnlyExplorer:
                 self.gimbal_front_down(force=True)
                 if not self.gimbal_front_safe_for_motion():
                     self.recover_gimbal_front()
+                self.apply_wall_heading_correction()
                 final_err = self.yaw_error_deg(target_yaw)
                 logical = self.logical_yaw_deg()
                 print(f"[TURN OK] {DIR_NAMES[target_dir]} logical_yaw={fmt_deg(logical)}deg residual={fmt_deg(final_err)}deg")
@@ -4603,6 +4632,126 @@ class DFSMapOnlyExplorer:
                 return mm
             self.fault("SCAN", f"no fresh ToF at yaw={yaw_deg:+.1f} attempt {attempt}", "retry")
         return None
+
+    # --------------------------------------------------------
+    # WALL-HEADING CORRECTION (ToF double-probe, IMU-independent)
+    # --------------------------------------------------------
+    @staticmethod
+    def _yaw_from_wall_hits(g1_deg, d1_m, g2_deg, d2_m, wall_look_yaw_deg, believed_yaw_deg):
+        """Two ToF hits on one straight wall -> the chassis's absolute yaw.
+
+        g1/g2 are gimbal yaw RELATIVE TO THE CHASSIS (deg); d1/d2 are the
+        matching ToF ranges (m). wall_look_yaw_deg is the world-frame yaw
+        this wall is expected to run perpendicular to (the cardinal target
+        yaw of the direction being looked at). A wall has no direction, so
+        the raw solution is resolved to whichever 180deg branch sits
+        nearest believed_yaw_deg. Returns None if the two hits are too
+        close together to fix an angle (near head-on, or bad geometry).
+        """
+        if d1_m is None or d2_m is None or believed_yaw_deg is None:
+            return None
+        p1x = d1_m * math.sin(math.radians(g1_deg))
+        p1y = d1_m * math.cos(math.radians(g1_deg))
+        p2x = d2_m * math.sin(math.radians(g2_deg))
+        p2y = d2_m * math.cos(math.radians(g2_deg))
+        vx, vy = p2x - p1x, p2y - p1y
+        if math.hypot(vx, vy) < WALL_HEADING_MIN_VECTOR_M:
+            return None
+        wall_dir_body = math.degrees(math.atan2(vx, vy))
+        heading = wrap_deg(wall_look_yaw_deg + 90.0 - wall_dir_body)
+        k = round(wrap_deg(believed_yaw_deg - heading) / 180.0)
+        return wrap_deg(heading + 180.0 * k)
+
+    def measure_heading_from_wall(self, look_offset_deg=0.0, wall_look_yaw_deg=None):
+        """Independently estimate absolute chassis yaw from a wall's geometry.
+
+        Probes the wall at ``look_offset_deg`` (gimbal-relative; 0 = front)
+        twice, WALL_HEADING_PROBE_DEG either side, and turns the two ToF
+        hits into a yaw estimate via ``_yaw_from_wall_hits``. Two probes
+        (left and right of the look direction) are combined by median for
+        a little extra robustness. Returns None if no usable wall geometry
+        was found -- callers should treat that as "no correction available"
+        rather than an error.
+        """
+        if not WALL_HEADING_ENABLED:
+            return None
+        if wall_look_yaw_deg is None:
+            wall_look_yaw_deg = self.desired_yaw_for_heading(self.heading)
+        if wall_look_yaw_deg is None:
+            return None
+        believed_yaw = self.current_yaw()
+        if believed_yaw is None:
+            return None
+
+        estimates = []
+        for sign in (+1.0, -1.0):
+            if not self.gimbal_goto(look_offset_deg, GIMBAL_PITCH_DEG):
+                continue
+            d1 = self.sample_fresh_tof()
+            _, g1 = self.current_gimbal_relative()
+
+            g2_target = look_offset_deg + sign * WALL_HEADING_PROBE_DEG
+            if not self.gimbal_goto(g2_target, GIMBAL_PITCH_DEG):
+                continue
+            d2 = self.sample_fresh_tof()
+            _, g2 = self.current_gimbal_relative()
+
+            if (
+                d1 is None or d2 is None or g1 is None or g2 is None
+                or not (WALL_HEADING_MIN_RANGE_MM <= d1 <= WALL_HEADING_MAX_RANGE_MM)
+                or not (WALL_HEADING_MIN_RANGE_MM <= d2 <= WALL_HEADING_MAX_RANGE_MM)
+            ):
+                continue
+
+            h = self._yaw_from_wall_hits(
+                g1, d1 / 1000.0, g2, d2 / 1000.0, wall_look_yaw_deg, believed_yaw,
+            )
+            if h is not None:
+                estimates.append(h)
+
+        self.gimbal_front_down(force=True)
+        if not estimates:
+            return None
+        return wrap_deg(statistics.median(estimates))
+
+    def apply_wall_heading_correction(self):
+        """Re-anchor base_yaw_deg toward a wall-measured heading.
+
+        IMU yaw integration drifts a little every turn with nothing to
+        check it against; this periodically re-anchors the logical yaw
+        zero to what the walls actually say instead of trusting the gyro
+        for the whole run. The correction is gated (reject outliers) and
+        clamped (never move more than WALL_HEADING_MAX_STEP_DEG at once),
+        so a single bad reading cannot throw the pose off. Safe to call
+        with no wall in range: it is then simply a no-op.
+        """
+        if not WALL_HEADING_ENABLED or self.base_yaw_deg is None:
+            return False
+        measured = self.measure_heading_from_wall()
+        if measured is None:
+            return False
+        current = self.current_yaw()
+        if current is None:
+            return False
+
+        err = wrap_deg(measured - current)
+        if abs(err) > WALL_HEADING_GATE_DEG:
+            self.fault(
+                "WALL HEADING",
+                f"rejected outlier correction {err:+.2f}deg (measured={measured:+.2f} imu={current:+.2f})",
+                "keep IMU yaw",
+            )
+            return False
+
+        step = max(-WALL_HEADING_MAX_STEP_DEG, min(WALL_HEADING_MAX_STEP_DEG, err))
+        self.base_yaw_deg = wrap_deg(self.base_yaw_deg + step)
+        if self.yaw_ref_deg is not None:
+            self.yaw_ref_deg = wrap_deg(self.yaw_ref_deg + step)
+        print(
+            f"[WALL HEADING] measured={measured:+.2f} imu={current:+.2f} "
+            f"applied={step:+.2f}deg (raw err {err:+.2f}deg)"
+        )
+        return True
 
     # --------------------------------------------------------
     # SHARP / IR
