@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RoboMaster EP - V20.3 DFS 10-MIN TURBO / TARGET + IR-SHARP FIX
+RoboMaster EP - V20.8 GUI ARENA + SPEED TUNING + ROUND-2 SHORTEST
 ================================================
 Purpose
 -------
@@ -13,7 +13,8 @@ removed so a target service cannot corrupt the node anchor.
 
 Runtime policy
 --------------
-* RUN pose is logical cell (0, 0); chassis FRONT at RUN is logical North.
+* RUN pose is logical cell (1, 0); chassis FRONT at RUN is logical North.
+* Arena geometry is profile-driven (arbitrary W x H, origin and start cell). Any sensed OPEN edge leading outside the configured arena is rejected before translation.
 * Gimbal ToF scans LEFT / FRONT / RIGHT at each newly visited cell.
 * At a confirmed dead-end only, FRONT target service temporarily backs ~35 cm
   along the traversed corridor, scans/fires, then returns to the node anchor.
@@ -65,10 +66,11 @@ except Exception:
 
 try:
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, filedialog
 except Exception:
     tk = None
     ttk = None
+    filedialog = None
 
 
 # ============================================================
@@ -96,6 +98,130 @@ STATUS_FREQ_HZ = 5
 GRID_TILE_M = 0.60
 CELL_LENGTH_M = 0.60
 CELL_SUCCESS_FRACTION = 0.82
+
+# Arena geometry is intentionally profile-driven instead of encoding any
+# particular exit coordinate in DFS logic.  The same engine supports arbitrary
+# rectangular arenas, translated logical origins, and arbitrary start cells.
+#
+# The built-in profile is only the default for today's field; it can be replaced
+# by --arena-config or individual CLI overrides without changing mapping code.
+DEFAULT_ARENA_PROFILE = {
+    "name": "competition_default",
+    "width_cells": 6,
+    "height_cells": 6,
+    "x_min": 0,
+    "y_min": 0,
+    "start_cell": [1, 0],
+    "boundary_guard": True,
+}
+
+ARENA_PROFILE_NAME = str(DEFAULT_ARENA_PROFILE["name"])
+GRID_WIDTH_CELLS = int(DEFAULT_ARENA_PROFILE["width_cells"])
+GRID_HEIGHT_CELLS = int(DEFAULT_ARENA_PROFILE["height_cells"])
+GRID_X_MIN = int(DEFAULT_ARENA_PROFILE["x_min"])
+GRID_Y_MIN = int(DEFAULT_ARENA_PROFILE["y_min"])
+GRID_X_MAX = GRID_X_MIN + GRID_WIDTH_CELLS - 1
+GRID_Y_MAX = GRID_Y_MIN + GRID_HEIGHT_CELLS - 1
+ROOT_CELL = tuple(int(v) for v in DEFAULT_ARENA_PROFILE["start_cell"][:2])
+FIELD_BOUNDARY_GUARD_ENABLED = bool(DEFAULT_ARENA_PROFILE["boundary_guard"])
+
+
+def apply_arena_profile(profile, source="runtime"):
+    """Apply a rectangular arena description to the generic DFS engine.
+
+    Supported keys: width_cells, height_cells, x_min, y_min, start_cell,
+    boundary_guard and optional name.  No fake-exit coordinate is accepted or
+    needed: perimeter rejection follows only from the configured rectangle.
+    """
+    global ARENA_PROFILE_NAME
+    global GRID_WIDTH_CELLS, GRID_HEIGHT_CELLS
+    global GRID_X_MIN, GRID_Y_MIN, GRID_X_MAX, GRID_Y_MAX
+    global ROOT_CELL, FIELD_BOUNDARY_GUARD_ENABLED, MAX_VISITED_CELLS
+
+    p = dict(DEFAULT_ARENA_PROFILE)
+    if isinstance(profile, dict):
+        for key in (
+            "name", "width_cells", "height_cells", "x_min", "y_min",
+            "start_cell", "boundary_guard",
+        ):
+            if key in profile and profile[key] is not None:
+                p[key] = profile[key]
+
+    width = int(p["width_cells"])
+    height = int(p["height_cells"])
+    x_min = int(p["x_min"])
+    y_min = int(p["y_min"])
+    if width <= 0 or height <= 0:
+        raise ValueError("arena width/height must be positive")
+
+    start = p.get("start_cell")
+    if not isinstance(start, (list, tuple)) or len(start) < 2:
+        raise ValueError("arena start_cell must contain x,y")
+    start = (int(start[0]), int(start[1]))
+    x_max = x_min + width - 1
+    y_max = y_min + height - 1
+    if not (x_min <= start[0] <= x_max and y_min <= start[1] <= y_max):
+        raise ValueError(
+            "arena start_cell {} is outside x={}..{}, y={}..{}".format(
+                start, x_min, x_max, y_min, y_max
+            )
+        )
+
+    ARENA_PROFILE_NAME = str(p.get("name") or "arena")
+    GRID_WIDTH_CELLS = width
+    GRID_HEIGHT_CELLS = height
+    GRID_X_MIN = x_min
+    GRID_Y_MIN = y_min
+    GRID_X_MAX = x_max
+    GRID_Y_MAX = y_max
+    ROOT_CELL = start
+    FIELD_BOUNDARY_GUARD_ENABLED = bool(p.get("boundary_guard", True))
+    # The runaway guard follows the configured field size, not one fixed maze.
+    try:
+        MAX_VISITED_CELLS = width * height
+    except Exception:
+        pass
+
+    print(
+        "[ARENA] profile={} source={} size={}x{} bounds=x{}..{} y{}..{} start={} boundary_guard={}".format(
+            ARENA_PROFILE_NAME, source, width, height, x_min, x_max, y_min, y_max,
+            ROOT_CELL, FIELD_BOUNDARY_GUARD_ENABLED,
+        )
+    )
+
+
+def load_arena_profile(path=None, overrides=None):
+    """Load an arena profile from JSON and/or CLI-style overrides."""
+    profile = dict(DEFAULT_ARENA_PROFILE)
+    source = "built-in default"
+    if path:
+        pth = Path(path)
+        payload = json.loads(pth.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("arena config must be a JSON object")
+        profile.update(payload)
+        source = str(pth)
+    if isinstance(overrides, dict):
+        for key, value in overrides.items():
+            if value is not None:
+                profile[key] = value
+        if any(v is not None for v in overrides.values()):
+            source += "+CLI"
+    apply_arena_profile(profile, source=source)
+    return profile
+
+
+def current_arena_profile():
+    """Return the active arena geometry as a serializable profile."""
+    return {
+        "name": str(ARENA_PROFILE_NAME),
+        "width_cells": int(GRID_WIDTH_CELLS),
+        "height_cells": int(GRID_HEIGHT_CELLS),
+        "x_min": int(GRID_X_MIN),
+        "y_min": int(GRID_Y_MIN),
+        "start_cell": [int(ROOT_CELL[0]), int(ROOT_CELL[1])],
+        "boundary_guard": bool(FIELD_BOUNDARY_GUARD_ENABLED),
+    }
 
 # Coordinate-frame geometry (measured on the real robot).
 #
@@ -199,12 +325,12 @@ SHARP_SIDE_ESCAPE_FAST_RELEASE_CM = 7.5
 # Unknown edges remain slower than already-proven OPEN edges for safety.
 # because the robot is still discovering topology; already-proven OPEN edges
 # can be traversed much faster during DFS backtrack / known-route travel.
-DFS_EXPLORE_SPEED_MPS = 0.34
-DFS_KNOWN_SPEED_MPS = 0.55
-DFS_EXPLORE_APPROACH_MIN_MPS = 0.12
-DFS_KNOWN_APPROACH_MIN_MPS = 0.16
-DFS_EXPLORE_APPROACH_SLOW_M = 0.11
-DFS_KNOWN_APPROACH_SLOW_M = 0.13
+DFS_EXPLORE_SPEED_MPS = 0.31  # tile/slip-safe
+DFS_KNOWN_SPEED_MPS = 0.48  # tile/slip-safe
+DFS_EXPLORE_APPROACH_MIN_MPS = 0.10
+DFS_KNOWN_APPROACH_MIN_MPS = 0.13
+DFS_EXPLORE_APPROACH_SLOW_M = 0.17
+DFS_KNOWN_APPROACH_SLOW_M = 0.19
 
 # Compatibility aliases.  Any legacy helper that still reads these constants
 # gets the conservative exploration profile rather than the 0.35 m/s fast path.
@@ -216,13 +342,13 @@ CELL_APPROACH_MIN_MPS = DFS_EXPLORE_APPROACH_MIN_MPS
 # Front-ToF approach/brake policy.  Do not jump directly from forward motion to
 # reverse when a wall appears.  Slow progressively, stop, then let the gimbal
 # inspect LEFT/FRONT/RIGHT because the wall can be the end of a valid DFS cell.
-FRONT_BRAKE_START_MM = 470.0
-FRONT_CRAWL_START_MM = 240.0
+FRONT_BRAKE_START_MM = 540.0  # brake earlier on smooth tile
+FRONT_CRAWL_START_MM = 270.0
 FRONT_STOP_SCAN_MM = 165.0
 # Faster known-edge travel starts braking sooner.  STOP_SCAN stays unchanged: it
 # is a physical clearance/sensing limit and must not become looser with speed.
-FRONT_BRAKE_START_FAST_MM = 520.0
-FRONT_CRAWL_START_FAST_MM = 255.0
+FRONT_BRAKE_START_FAST_MM = 610.0
+FRONT_CRAWL_START_FAST_MM = 290.0
 FRONT_SLOW_MM = FRONT_BRAKE_START_MM   # compatibility name used in logs/tuning
 FRONT_HARD_STOP_MM = FRONT_STOP_SCAN_MM
 FRONT_MIN_BRAKE_SPEED_MPS = 0.065
@@ -235,10 +361,19 @@ FRONT_MIDEDGE_MAX_PROGRESS_M = 0.30
 FRONT_TOF_STALE_SEC = 0.70
 
 CONTROL_DT = 0.04
+# Smooth-tile traction guard: limit only acceleration into forward motion.
+# Safety/braking commands are allowed to reduce speed immediately.
+SLIPPERY_TILE_MODE = True
+MOVE_FORWARD_ACCEL_LIMIT_MPS2 = 0.80
+POST_MOVE_TILE_SETTLE_SEC = 0.08
 DRIVE_COMMAND_TIMEOUT = 0.25
 POSITION_STALE_SEC = 0.60
 ATTITUDE_STALE_SEC = 0.40
 MAX_CELL_TIME_SEC = max(6.0, (CELL_LENGTH_M / DFS_EXPLORE_SPEED_MPS) * 2.8)
+# Bounded recovery for a cell that times out only because side-safety maneuvers
+# consumed the motion watchdog while the front path is still sensor-confirmed OPEN.
+MOVE_TIMEOUT_OPEN_RETRIES = 2
+MOVE_TIMEOUT_OPEN_EXTENSION_SEC = 3.0
 
 # If translation really must abort, return to the source smoothly.  Retreat is
 # projection-based (forward + lateral), so a 5-8 cm Mecanum side drift no longer
@@ -287,6 +422,20 @@ IR_SIMPLE_DEST_SHARP_CAUTION_CM = 9.0
 IR_SIMPLE_SOURCE_SHARP_CLEAR_CM = 9.0
 IR_SIMPLE_SOURCE_SHARP_CLEAR_MIN_MOVE_M = 0.035
 IR_SIMPLE_RETRIGGER_COOLDOWN_SEC = 0.35
+# If the IR-requested escape direction is physically blocked by the opposite
+# Sharp sensor, suppress that same IR request longer. This prevents a ping-pong
+# where RIGHT IR repeatedly asks for LEFT strafe while LEFT Sharp is already at
+# 5-7 cm (and vice versa).
+IR_DESTINATION_VETO_COOLDOWN_SEC = 1.20
+IR_DESTINATION_VETO_CM = 8.5
+
+# Competition sunlight hardening: the digital side IRs can false-trigger under
+# strong ambient IR.  Treat a one-sided LOW as a secondary hint only.  A real
+# side/corner hazard must also be corroborated by the Sharp sensor on the SAME
+# side being close.  Front ToF + Sharp remain the primary collision sensors.
+IR_SUNLIGHT_GUARD_ENABLED = True
+IR_SUNLIGHT_CORROBORATE_MAX_CM = 10.0
+IR_SUNLIGHT_IGNORE_COOLDOWN_SEC = 0.65
 
 # Lateral mecanum motion disturbs chassis yaw more than straight driving.
 # Use a dedicated stronger P hold during IR / Sharp pure-strafe recovery without
@@ -383,18 +532,18 @@ POST_MOVE_ALIGN_TOL_DEG = 0.45
 TURN_KP = 1.55
 TURN_KI = 0.035
 TURN_KD = 0.22
-TURN_MAX_DPS = 90.0
-TURN_FINE_MAX_DPS = 38.0
+TURN_MAX_DPS = 75.0  # reduce mecanum turn overshoot on tile
+TURN_FINE_MAX_DPS = 31.0
 TURN_FINE_ZONE_DEG = 14.0
-TURN_MIN_DPS = 8.0
-TURN_FINE_MIN_DPS = 4.0
+TURN_MIN_DPS = 6.5
+TURN_FINE_MIN_DPS = 3.5
 TURN_TOLERANCE_DEG = 0.90
 TURN_SETTLE_SEC = 0.12
 TURN_CONTROL_HZ = 40.0
 TURN_I_LIMIT = 7.0
 TURN_I_ZONE_DEG = 12.0
 TURN_D_ALPHA = 0.72
-TURN_TIMEOUT_90_SEC = 3.4
+TURN_TIMEOUT_90_SEC = 3.8
 TURN_TIMEOUT_180_SEC = 5.0
 TURN_RECOVERY_ATTEMPTS = 2
 TURN_RECOVERY_TIMEOUT_SCALE = 1.35
@@ -444,16 +593,16 @@ GIMBAL_RECOVERY_PITCH_TOL_DEG = 2.0
 GIMBAL_RECOVERY_SETTLE_SAMPLES = 2
 GIMBAL_SETTLE_SEC = 0.035
 GIMBAL_SCAN_RETRIES = 0
-UNKNOWN_EDGE_RESCAN_PASSES = 2
-UNKNOWN_EDGE_RESCAN_SETTLE_SEC = 0.07
+UNKNOWN_EDGE_RESCAN_PASSES = 1
+UNKNOWN_EDGE_RESCAN_SETTLE_SEC = 0.04
 GIMBAL_SOFT_YAW_MIN_DEG = -135.0
 GIMBAL_SOFT_YAW_MAX_DEG = +135.0
 GIMBAL_SOFT_PITCH_MIN_DEG = -15.0
 GIMBAL_SOFT_PITCH_MAX_DEG = +20.0
 
-TOF_SCAN_SAMPLES = 5
-TOF_SCAN_INTERVAL_SEC = 0.040
-TOF_SCAN_TIMEOUT_SEC = 0.70
+TOF_SCAN_SAMPLES = 3
+TOF_SCAN_INTERVAL_SEC = 0.025
+TOF_SCAN_TIMEOUT_SEC = 0.45
 TOF_VALID_MIN_MM = 20.0
 TOF_VALID_MAX_MM = 10000.0
 
@@ -471,6 +620,19 @@ STARTUP_GIMBAL_ACCEPT_PITCH_MAX_DEG = +5.0
 ROOT_BACK_SCAN_ENABLED = True
 ROOT_BACK_RESTORE_RETRIES = 2
 
+# ============================================================
+# FAKE-EXIT / WIDE-OPEN GUARD
+# ============================================================
+# Competition fields may contain a fake exit: once the robot crosses the opening,
+# the next logical cell can look like a large open area rather than a 60-cm maze
+# corridor.  Never finish the map just because an opening looks like an exit.
+# First require a strict wide-open signature: L/F/R are OPEN, BACK is the
+# physically-traversed edge, and both +/-45-degree diagonal rays are also long.
+FAKE_EXIT_GUARD_ENABLED = False  # configured rectangular boundary guard is authoritative
+FAKE_EXIT_DIAG_YAWS_DEG = (-45.0, +45.0)
+FAKE_EXIT_DIAG_MIN_CENTER_MM = 900.0
+FAKE_EXIT_REQUIRE_ALL_CARDINAL_OPEN = True
+
 
 # ============================================================
 # MAP / LIMIT GUARDS
@@ -479,11 +641,14 @@ MAP_DIR = Path("maps")
 MAP_LATEST_JSON = MAP_DIR / "latest_map.json"
 MAP_LATEST_ASCII = MAP_DIR / "latest_map.txt"
 MAP_LATEST_SVG = MAP_DIR / "latest_map.svg"
+# Chronological motion history.  Unlike the topology graph, this preserves
+# exactly WHICH known/open edge was physically traversed and in what order.
+BREADCRUMB_LATEST_JSON = MAP_DIR / "latest_breadcrumb.json"
 MAP_AUTOSAVE = True
 
 # Last-resort runaway guard.  It does not define maze geometry; it only prevents
 # a bad sensor from producing an unbounded graph forever.
-MAX_VISITED_CELLS = 80
+MAX_VISITED_CELLS = GRID_WIDTH_CELLS * GRID_HEIGHT_CELLS
 MAX_MISSION_SEC = 10 * 60
 
 
@@ -521,14 +686,14 @@ TARGET_SEARCH_YAW_LIMIT_DEG = 110.0
 TARGET_SEARCH_PITCH_DEG = -10.0
 TARGET_SEARCH_QUICK_GATE_FRAMES = 2
 TARGET_SEARCH_MIN_FRESH_FRAMES = 2
-TARGET_SCAN_SETTLE_SEC = 0.030
-TARGET_SCAN_COOLDOWN_SEC = 0.35
+TARGET_SCAN_SETTLE_SEC = 0.015
+TARGET_SCAN_COOLDOWN_SEC = 0.18
 
-TARGET_SWEEP_SPEED_DPS = 95.0
-TARGET_SWEEP_MIN_DPS = 30.0
-TARGET_SWEEP_FINE_ZONE_DEG = 6.0
-TARGET_SWEEP_CONTROL_DT = 0.040
-TARGET_SWEEP_TIMEOUT_SEC = 3.00
+TARGET_SWEEP_SPEED_DPS = 125.0
+TARGET_SWEEP_MIN_DPS = 45.0
+TARGET_SWEEP_FINE_ZONE_DEG = 4.0
+TARGET_SWEEP_CONTROL_DT = 0.025
+TARGET_SWEEP_TIMEOUT_SEC = 2.15
 # V20.1: target scanning does not need topology-grade exact endpoint poses.
 # A sector may start a few degrees early/late and still sweep through the useful cone.
 TARGET_SEARCH_POSE_YAW_TOL_DEG = 4.0
@@ -536,8 +701,8 @@ TARGET_SEARCH_POSE_SOFT_YAW_TOL_DEG = 12.0
 TARGET_SEARCH_POSE_PITCH_TOL_DEG = 5.0
 TARGET_GIMBAL_STALL_WINDOW_SEC = 0.28
 TARGET_GIMBAL_STALL_MIN_PROGRESS_DEG = 0.8
-TARGET_SWEEP_MAX_INTERRUPTS_PER_SECTOR = 8
-TARGET_SWEEP_RESUME_ADVANCE_DEG = 6.0
+TARGET_SWEEP_MAX_INTERRUPTS_PER_SECTOR = 6
+TARGET_SWEEP_RESUME_ADVANCE_DEG = 8.0
 # Successful locks suppress the same color/shape around the original SWEEP
 # bearing, not the post-Aim bearing.  Failed Aim gets a smaller cone so a
 # genuinely separate nearby target can still be acquired.
@@ -553,6 +718,27 @@ TARGET_PREFERRED_ACQUISITION_CONES = {
     "FRONT": ( -10.0, +10.0),
     "RIGHT": ( +80.0, +100.0),
 }
+
+# V20.7 GOOD-ANGLE FIRE GATE.
+# Detection / tracking stays wide so we never throw away a visible target, but
+# WATER fire is authorized only when the FINAL crosshair lock is close to the
+# sector's cardinal shooting direction.  This prevents a -50/-60deg side shot
+# from being counted as fired before the robot later gets a much better -90deg
+# view.  Keep these separate from acquisition cones so search coverage remains
+# unchanged.
+TARGET_GOOD_FIRE_CONES = {
+    # Side shots are intentionally looser than the previous strict +/-10deg gate.
+    # Field behavior was acceptable around the old side acquisition cone, while
+    # the dangerous misses happened mostly near the FRONT seam (~45-60deg).
+    "LEFT":  (-110.0, -70.0),
+    "FRONT": ( -15.0, +15.0),
+    "RIGHT": ( +70.0, +110.0),
+}
+# A bad-angle observation is only suppressed very locally.  The same physical
+# target may be reacquired a few degrees later in the SAME sweep if the geometry
+# improves; it is NOT treated like a successful shot.
+TARGET_BAD_ANGLE_RETRY_SUPPRESS_DEG = 4.0
+
 TARGET_SOFT_ACQUISITION_EXTRA_DEG = 10.0
 
 # name, sweep_start, sweep_end, temporary chassis slide, SOFT acquisition low/high.
@@ -583,62 +769,59 @@ TARGET_FRONT_CROSSHAIR_AIM_HALF_DEG = 55.0
 TARGET_SIDE_CROSSHAIR_AIM_INNER_DEG = 35.0
 TARGET_SIDE_CROSSHAIR_AIM_OUTER_DEG = 120.0
 
-# Temporary SIDE viewpoint shift.
-# LEFT sector : point ToF LEFT (-90) and slide RIGHT until the LEFT wall/board
-#               is about 350 mm away.
-# RIGHT sector: point ToF RIGHT (+90) and slide LEFT until the RIGHT wall/board
-#               is about 350 mm away.
-# The Sharp sensor on the DESTINATION side is only a collision guard.  If it
-# reaches 6 cm before the source-side ToF reaches 350 mm, STOP and scan anyway.
-# If the source-side ToF cannot be obtained, do not blindly strafe; scan from the
-# current anchor instead ("if it cannot reach 35 cm, that's okay").
+# Temporary SIDE viewpoint shift -- V20.7 FULL-35 ODOMETRY POLICY.
+#
+# IMPORTANT: the 35 cm requirement is CAMERA VIEWPOINT displacement, not distance
+# from a wall.  LEFT target search always attempts to move the chassis RIGHT by
+# ~35 cm; RIGHT target search mirrors it LEFT.  This creates enough camera distance
+# for close side targets to fit the detector/shape gate even when there is no wall.
+#
+# Odometry owns normal stopping/speed.  Destination Sharp is read fresh every
+# control cycle and has exactly one job: emergency collision STOP.
 TARGET_SIDE_SHIFT_ENABLED = True
-TARGET_SIDE_SHIFT_SOURCE_GOAL_MM = 350.0
-# V20.6: 35 cm is a real viewpoint target, not an early "close enough" hint.
-# Stop only once source-side ToF is within ~8 mm of 350 mm.
-TARGET_SIDE_SHIFT_SOURCE_GOAL_TOL_MM = 8.0
-TARGET_SIDE_SHIFT_TOF_PITCH_DEG = GIMBAL_PITCH_DEG
-TARGET_SIDE_SHIFT_TOF_SAMPLES = 2
-TARGET_SIDE_SHIFT_TOF_TIMEOUT_SEC = 0.45
-# V20.6 FAST-35 SIDE-SHIFT POLICY.
-# The old 0.20 m/s + 6 cm hard stop was too aggressive for the GP2Y0A41SK
-# because the normal Sharp path uses a 5-sample median.  At side-shift speed the
-# filtered value can lag the real wall by several centimetres.  Side viewpoint
-# shifts therefore use a dedicated low-latency Sharp read at ~50 Hz.
-# Sharp does NOT create normal speed tiers; it only stops at the hard collision guard.
-# V20.6: Sharp is a COLLISION GUARD, not a substitute for the 350 mm ToF goal.
-# In a ~60 cm corridor, reaching 35 cm from the source wall can legitimately leave
-# only ~8-10 cm at the opposite chassis side.  V20.4 stopped at 8.5-9.8 cm and
-# therefore often never reached the required viewpoint.  V20.6 keeps full speed
-# until the ToF remaining-distance tiers say to slow, unless Sharp hits hard stop.
-TARGET_SIDE_SHIFT_DEST_CAUTION_CM = 8.2  # V20.6: log/predictive brake only; no speed tier
-TARGET_SIDE_SHIFT_DEST_BRAKE_CM = 7.6   # V20.6: predictive stop reference only
-TARGET_SIDE_SHIFT_DEST_CRAWL_CM = 7.0   # V20.6: no crawl tier from Sharp
-TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM = 6.8
+TARGET_SIDE_SHIFT_DISTANCE_M = 0.350
+TARGET_SIDE_SHIFT_STOP_TOL_M = 0.008       # >=342 mm counts as full viewpoint
+TARGET_SIDE_SHIFT_MAX_M = 0.375            # runaway/overshoot guard only
+TARGET_SIDE_SHIFT_SPEED_MPS = 0.185  # tile/slip-safe        # remaining >65 mm
+TARGET_SIDE_SHIFT_MED_SPEED_MPS = 0.120    # remaining <=65 mm
+TARGET_SIDE_SHIFT_SLOW_MPS = 0.065         # remaining <=32 mm
+TARGET_SIDE_SHIFT_CRAWL_MPS = 0.040        # remaining <=14 mm
+TARGET_SIDE_SHIFT_MED_REMAIN_M = 0.065
+TARGET_SIDE_SHIFT_SLOW_REMAIN_M = 0.032
+TARGET_SIDE_SHIFT_CRAWL_REMAIN_M = 0.014
+TARGET_SIDE_SHIFT_CONTROL_DT = 0.020       # ~50 Hz Sharp guard
+TARGET_SIDE_SHIFT_TIMEOUT_SEC = 3.2
+
+# Sharp: direct STOP only.  Field log showed 6.8 cm could arrive one callback too
+# late at 0.22 m/s, so use 9 cm as the software brake line; no Sharp speed tiers.
+TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM = 9.0
 TARGET_SIDE_SHIFT_HARD_STOP_CONFIRM_CYCLES = 1
 TARGET_SIDE_SHIFT_FAST_SHARP_SAMPLES = 1
 TARGET_SIDE_SHIFT_FAST_SHARP_INTERVAL_SEC = 0.0
 TARGET_SIDE_SHIFT_SHARP_MISSING_MAX_CYCLES = 2
-TARGET_SIDE_SHIFT_SHARP_MISSING_SPEED_MPS = 0.0  # true missing Sharp => stop, never crawl blind
-# Support starts as close as ~3-4 cm from the source wall: 350 mm goal can require
-# about 0.31 m of lateral travel.  Sharp remains the physical collision veto.
-TARGET_SIDE_SHIFT_MAX_M = 0.325
-TARGET_SIDE_SHIFT_SPEED_MPS = 0.220
-TARGET_SIDE_SHIFT_MED_SPEED_MPS = 0.145
-TARGET_SIDE_SHIFT_SLOW_MPS = 0.080
-TARGET_SIDE_SHIFT_CRAWL_MPS = 0.040
-TARGET_SIDE_SHIFT_SOURCE_MED_GAP_MM = 65.0
-TARGET_SIDE_SHIFT_SOURCE_SLOW_GAP_MM = 32.0
-TARGET_SIDE_SHIFT_SOURCE_CRAWL_GAP_MM = 14.0
-TARGET_SIDE_SHIFT_CONTROL_DT = 0.020  # 50 Hz fresh Sharp guard
-TARGET_SIDE_SHIFT_ACCEL_MPS2 = 99.0  # V20.6: effectively immediate speed step; Sharp handles emergency stop
-TARGET_SIDE_SHIFT_TIMEOUT_SEC = 4.2
-# Return-to-anchor is also guarded by the same fresh Sharp hard-stop path.
-TARGET_SIDE_SHIFT_RETURN_SPEED_MPS = 0.22
-TARGET_SIDE_SHIFT_RETURN_TIMEOUT_SEC = 3.0
-TARGET_SIDE_SHIFT_RETURN_LAT_TOL_M = 0.022
+
+# Return runs over the path just proven moments earlier, so it can be much faster.
+TARGET_SIDE_SHIFT_RETURN_SPEED_MPS = 0.29
+TARGET_SIDE_SHIFT_RETURN_MED_SPEED_MPS = 0.17
+TARGET_SIDE_SHIFT_RETURN_SLOW_MPS = 0.08
+TARGET_SIDE_SHIFT_RETURN_MED_ZONE_M = 0.080
+TARGET_SIDE_SHIFT_RETURN_SLOW_ZONE_M = 0.035
+TARGET_SIDE_SHIFT_RETURN_TIMEOUT_SEC = 2.2
+TARGET_SIDE_SHIFT_RETURN_LAT_TOL_M = 0.018
 TARGET_SIDE_SHIFT_RETURN_FWD_TOL_M = 0.030
-TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M = 0.045
+TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M = 0.040
+
+# Adaptive short AIM deadline: normal lock gets 2.4 s; only a genuinely near-center
+# target receives one small grace extension.
+TARGET_AIM_NEAR_CENTER_GRACE_SEC = 0.45
+TARGET_AIM_NEAR_CENTER_GRACE_ERR = 0.055
+
+# Fast fired-memory suppression is shape-independent because the same physical
+# square can look rectangular from an oblique side viewpoint.
+TARGET_FAST_FIRED_GRID_DIST = 0.70
+TARGET_FAST_FIRED_SAME_CELL_BEARING_DEG = 20.0
+TARGET_CHASSIS_REALIGN_TRIGGER_DEG = 2.0
+TARGET_CHASSIS_REALIGN_TIMEOUT_SEC = 0.35
 
 # Temporary FRONT viewpoint shift at a CONFIRMED dead-end only.
 # A dead-end must have LEFT + FRONT + RIGHT all explicitly classified WALL by
@@ -648,12 +831,12 @@ TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M = 0.045
 # This motion never changes the logical cell or the map.
 TARGET_DEADEND_FRONT_BACKSHIFT_ENABLED = True
 TARGET_DEADEND_FRONT_BACKSHIFT_M = 0.350
-TARGET_DEADEND_FRONT_BACKSHIFT_SPEED_MPS = 0.20
-TARGET_DEADEND_FRONT_BACKSHIFT_SLOW_MPS = 0.090
-TARGET_DEADEND_FRONT_BACKSHIFT_SLOW_ZONE_M = 0.080
+TARGET_DEADEND_FRONT_BACKSHIFT_SPEED_MPS = 0.21
+TARGET_DEADEND_FRONT_BACKSHIFT_SLOW_MPS = 0.12
+TARGET_DEADEND_FRONT_BACKSHIFT_SLOW_ZONE_M = 0.060
 TARGET_DEADEND_FRONT_BACKSHIFT_TIMEOUT_SEC = 3.6
-TARGET_DEADEND_FRONT_RETURN_SPEED_MPS = 0.22
-TARGET_DEADEND_FRONT_RETURN_SLOW_MPS = 0.10
+TARGET_DEADEND_FRONT_RETURN_SPEED_MPS = 0.25
+TARGET_DEADEND_FRONT_RETURN_SLOW_MPS = 0.14
 TARGET_DEADEND_FRONT_RETURN_TIMEOUT_SEC = 3.6
 TARGET_DEADEND_FRONT_RETURN_FWD_TOL_M = 0.025
 TARGET_DEADEND_FRONT_RETURN_LAT_TOL_M = 0.030
@@ -720,15 +903,15 @@ TARGET_HISTORY_SEC = 1.25
 # AIM lock.  The friend's branch uses a 1.5% reticle tolerance; use the same
 # order of precision while retaining a little extra vertical tolerance for the
 # current gimbal/camera mount.
-TARGET_AIM_TIMEOUT_SEC = 4.5
+TARGET_AIM_TIMEOUT_SEC = 2.40
 TARGET_AIM_POLL_SEC = 0.020
-TARGET_AIM_LOST_GRACE_SEC = 0.55
+TARGET_AIM_LOST_GRACE_SEC = 0.35
 # V15 center-only fire lock: tighter vertical tolerance, smaller servo deadband,
 # and 3 consecutive centred frames before the ToF/fire pipeline.  center_norm is
 # the bounding-box centre produced by _detect_targets().
 TARGET_AIM_CENTER_TOL_X = 0.020
 TARGET_AIM_CENTER_TOL_Y = 0.020
-TARGET_AIM_CENTER_HOLD_FRAMES = 3
+TARGET_AIM_CENTER_HOLD_FRAMES = 2
 TARGET_AIM_YAW_GAIN_DPS = 150.0
 TARGET_AIM_PITCH_GAIN_DPS = 110.0
 TARGET_AIM_YAW_MAX_DPS = 52.0
@@ -793,11 +976,11 @@ TARGET_INFRARED_SHOTS = 1
 # zone; 350-1200 mm remains legal fallback so a good locked target is not wasted.
 TARGET_FIRE_PREFERRED_RANGE_MM = 350.0
 TARGET_FIRE_MAX_RANGE_MM = 1200.0
-TARGET_FIRE_RANGE_SAMPLES = 5
-TARGET_FIRE_RANGE_RECHECK_SEC = 0.05
-TARGET_FIRE_SETTLE_SEC = 0.07
-TARGET_DEDUPE_GRID_DIST = 0.55
-TARGET_DEDUPE_BEARING_DEG = 22.0
+TARGET_FIRE_RANGE_SAMPLES = 3
+TARGET_FIRE_RANGE_RECHECK_SEC = 0.03
+TARGET_FIRE_SETTLE_SEC = 0.035
+TARGET_DEDUPE_GRID_DIST = 0.65
+TARGET_DEDUPE_BEARING_DEG = 20.0
 
 # V10 selectable physical firing mode. GUI can change this live.
 TARGET_FIRE_MODE_DEFAULT = "INFRARED"
@@ -1637,6 +1820,7 @@ class TargetVisionSubsystem:
         chassis_hold_yaw=self.owner.desired_yaw_for_heading(self.owner.heading)
         self.owner.pid_straight.reset()
         deadline=time.monotonic()+TARGET_AIM_TIMEOUT_SEC
+        grace_used=False
         last_seq=-1; lost_since=None; centered_frames=0
         last_err=(None,None); verify_failures=0
         print(f"[TARGET ACQUIRE] {current.get('color')} {current.get('shape')} score={current.get('score',0):.2f}")
@@ -1707,6 +1891,50 @@ class TargetVisionSubsystem:
                     self._set_focus_roi(locked)
                     return locked
                 time.sleep(TARGET_AIM_POLL_SEC)
+            # One short grace only when the target is genuinely almost centered.
+            ex,ey=last_err
+            if (
+                not grace_used and ex is not None and ey is not None
+                and abs(ex) <= TARGET_AIM_NEAR_CENTER_GRACE_ERR
+                and abs(ey) <= TARGET_AIM_NEAR_CENTER_GRACE_ERR
+                and self.owner.running and self.running
+            ):
+                grace_used=True
+                deadline=time.monotonic()+TARGET_AIM_NEAR_CENTER_GRACE_SEC
+                print(
+                    f"[TARGET AIM GRACE] near center err=({ex:+.3f},{ey:+.3f}) "
+                    f"+{TARGET_AIM_NEAR_CENTER_GRACE_SEC:.2f}s"
+                )
+                while self.owner.running and self.running and time.monotonic()<deadline:
+                    with self.lock: seq=self.frame_seq
+                    if seq==last_seq:
+                        time.sleep(TARGET_AIM_POLL_SEC); continue
+                    last_seq=seq
+                    latest=self._latest_match(current,expected,allow_blob_fallback=True)
+                    if latest is None:
+                        time.sleep(TARGET_AIM_POLL_SEC); continue
+                    current.update(latest); expected=list(current.get("center_norm",expected)); self._set_focus_roi(current)
+                    cx,cy=[float(v) for v in expected]
+                    ex=cx-(0.5+TARGET_AIM_OFFSET_X); ey=cy-(0.5+TARGET_AIM_OFFSET_Y)
+                    last_err=(ex,ey)
+                    if abs(ex)<=TARGET_AIM_CENTER_TOL_X and abs(ey)<=TARGET_AIM_CENTER_TOL_Y:
+                        centered_frames+=1; self._stop_gimbal_velocity()
+                    else:
+                        centered_frames=0
+                        if not self._aim_velocity(expected, yaw_min=aim_yaw_min, yaw_max=aim_yaw_max): break
+                    if centered_frames>=TARGET_AIM_CENTER_HOLD_FRAMES:
+                        locked=dict(current)
+                        locked["crosshair_centered"]=True
+                        locked["crosshair_error_norm"]=[float(ex),float(ey)]
+                        locked["center_hold_frames"]=int(centered_frames)
+                        print(
+                            f"[TARGET CENTER LOCK] {locked.get('color')} {locked.get('shape')} "
+                            f"bbox-center err=({ex:+.3f},{ey:+.3f}) hold={centered_frames}/{TARGET_AIM_CENTER_HOLD_FRAMES} -> ToF/fire pipeline"
+                        )
+                        self._set_focus_roi(locked)
+                        return locked
+                    time.sleep(TARGET_AIM_POLL_SEC)
+
             p_end,y_end=self.owner.current_gimbal_relative()
             ex,ey=last_err
             print(
@@ -1724,10 +1952,10 @@ class TargetVisionSubsystem:
             if chassis_hold_yaw is not None:
                 try:
                     aim_exit_err = self.owner.yaw_error_deg(chassis_hold_yaw)
-                    if aim_exit_err is None or abs(aim_exit_err) > PRE_MOVE_ALIGN_TOL_DEG:
+                    if aim_exit_err is None or abs(aim_exit_err) > TARGET_CHASSIS_REALIGN_TRIGGER_DEG:
                         self.owner.align_heading_stationary(
-                            chassis_hold_yaw,timeout_sec=0.60,
-                            tolerance_deg=max(0.75,PRE_MOVE_ALIGN_TOL_DEG),settle_sec=0.045,
+                            chassis_hold_yaw,timeout_sec=TARGET_CHASSIS_REALIGN_TIMEOUT_SEC,
+                            tolerance_deg=max(0.90,PRE_MOVE_ALIGN_TOL_DEG),settle_sec=0.035,
                         )
                 except Exception:
                     pass
@@ -1746,6 +1974,15 @@ class TargetVisionSubsystem:
         """Return the original narrow preferred acquisition cone for telemetry/UI."""
         name = str(sector_name or "").upper()
         cone = TARGET_PREFERRED_ACQUISITION_CONES.get(name)
+        if cone is None:
+            return None
+        return float(cone[0]), float(cone[1])
+
+    @staticmethod
+    def _sector_good_fire_cone(sector_name):
+        """Final physical-fire cone; search/track may remain much wider."""
+        name = str(sector_name or "").upper()
+        cone = TARGET_GOOD_FIRE_CONES.get(name)
         if cone is None:
             return None
         return float(cone[0]), float(cone[1])
@@ -1787,24 +2024,15 @@ class TargetVisionSubsystem:
         y = float(yaw_deg)
         return float(lo) <= y <= float(hi)
 
-    def _temporary_side_shift(self, direction, anchor_pos=None):
-        """Temporarily strafe away from the wall inspected by a side sector.
+    def _temporary_side_shift(self, direction, anchor_pos=None, preposition_yaw=None):
+        """Move the chassis laterally ~35 cm to create the side-camera viewpoint.
 
-        V20.6 FAST-35 policy:
-          * SOURCE-side ToF still owns the ~350 mm viewpoint goal.
-          * Speed is selected ONLY from remaining distance to that goal:
-              >65 mm -> 0.220 m/s, <=65 -> 0.145, <=32 -> 0.080, <=14 -> 0.040.
-          * DESTINATION Sharp is sampled every control cycle with a fresh raw ADC
-            read.  It no longer creates multiple slow-speed zones; it is an
-            emergency brake only.
-          * At high speed a short reaction-horizon guard converts Sharp clearance
-            directly into STOP instead of spending time crawling through several
-            Sharp speed tiers.
-          * A genuinely unavailable destination Sharp stops the optional shift
-            quickly instead of crawling blind.
+        V20.7 fixes the old semantic mistake: 35 cm is the *chassis displacement*
+        from the logical node anchor, not a 350 mm wall-ToF target.  Therefore a
+        side shift is attempted even when the side is completely OPEN.
 
-        This preserves the full ~35 cm side viewpoint whenever geometry allows it,
-        while keeping the open part of a corridor fast.
+        Speed depends only on remaining odometric shift.  Fresh destination Sharp
+        is sampled at ~50 Hz and can only emergency-STOP the excursion.
         """
         token = {
             "direction": direction,
@@ -1812,7 +2040,6 @@ class TargetVisionSubsystem:
             "target_yaw": self.owner.desired_yaw_for_heading(self.owner.heading),
             "shift_m": 0.0,
             "result": "NO_SHIFT",
-            "source_wall_tof_mm": None,
             "dest_sharp_cm": None,
         }
         if not TARGET_SIDE_SHIFT_ENABLED or direction not in ("LEFT", "RIGHT"):
@@ -1829,60 +2056,34 @@ class TargetVisionSubsystem:
             token["result"] = "NO_POSITION"
             return token
 
+        # Only pay for a stationary realign if chassis yaw is visibly off.
         shift_yaw_err = self.owner.yaw_error_deg(token["target_yaw"])
-        if shift_yaw_err is None or abs(shift_yaw_err) > PRE_MOVE_ALIGN_TOL_DEG:
+        if shift_yaw_err is None or abs(shift_yaw_err) > TARGET_CHASSIS_REALIGN_TRIGGER_DEG:
             self.owner.align_heading_stationary(
-                token["target_yaw"], timeout_sec=0.65,
-                tolerance_deg=max(0.75, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.05,
+                token["target_yaw"], timeout_sec=0.45,
+                tolerance_deg=max(0.90, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.035,
             )
         self.owner.pid_straight.reset()
 
         sign = +1.0 if direction == "RIGHT" else -1.0
         dest_side = "RIGHT" if sign > 0 else "LEFT"
-        source_side = "LEFT" if sign > 0 else "RIGHT"
-        source_wall_yaw = -90.0 if sign > 0 else +90.0
 
-        # Put ToF on the wall we are moving AWAY from before any side motion.
-        if not self._goto_target_pose_strict(
-            source_wall_yaw, TARGET_SIDE_SHIFT_TOF_PITCH_DEG, timeout_sec=1.25
-        ):
-            token["result"] = f"NO_{source_side}_TOF_POSE"
-            print(
-                f"[TARGET SHIFT {dest_side}] cannot point ToF {source_side}; "
-                "skip shift and scan from anchor"
-            )
-            return token
-
-        time.sleep(0.04)
-        source_mm = self.owner.sample_fresh_tof(
-            samples=TARGET_SIDE_SHIFT_TOF_SAMPLES,
-            timeout=TARGET_SIDE_SHIFT_TOF_TIMEOUT_SEC,
-        )
-        token["source_wall_tof_mm"] = source_mm
-        if source_mm is None:
-            token["result"] = f"NO_{source_side}_TOF"
-            print(
-                f"[TARGET SHIFT {dest_side}] {source_side} ToF unavailable -> "
-                "no blind slide; scan from anchor"
-            )
-            return token
-
-        if source_mm >= TARGET_SIDE_SHIFT_SOURCE_GOAL_MM - TARGET_SIDE_SHIFT_SOURCE_GOAL_TOL_MM:
-            token["result"] = f"{source_side}_TOF_35CM_READY"
-            print(
-                f"[TARGET SHIFT DONE] dir={direction} shift=0.000m "
-                f"{source_side}ToF={source_mm:.0f}mm already~=35cm"
-            )
-            return token
+        # Hide gimbal reposition time underneath the 35 cm chassis slide.  The
+        # later sector sweep still verifies feedback before it starts, so failure
+        # here only loses the overlap optimization, never target coverage.
+        if preposition_yaw is not None:
+            try:
+                self.owner.gimbal.moveto(
+                    pitch=float(TARGET_SEARCH_PITCH_DEG), yaw=float(preposition_yaw),
+                    pitch_speed=float(GIMBAL_PITCH_SPEED), yaw_speed=float(GIMBAL_YAW_SPEED),
+                )
+            except Exception:
+                pass
 
         start_t = time.monotonic()
         last_log = 0.0
-        stop_reason = "MAX_SHIFT"
-        tof_hist = deque(maxlen=3)
-        tof_hist.append(float(source_mm))
         missing_sharp_cycles = 0
-        hard_close_cycles = 0
-        last_speed = 0.0
+        stop_reason = "FULL_35CM"
 
         while self.owner.running and self.running:
             now = time.monotonic()
@@ -1894,33 +2095,20 @@ class TargetVisionSubsystem:
             lateral = self.owner.cell_lateral_offset(anchor_pos, pos, token["target_yaw"])
             shifted = max(0.0, sign * float(lateral))
             token["shift_m"] = shifted
+            remaining = max(0.0, TARGET_SIDE_SHIFT_DISTANCE_M - shifted)
+
+            if shifted >= TARGET_SIDE_SHIFT_DISTANCE_M - TARGET_SIDE_SHIFT_STOP_TOL_M:
+                stop_reason = "FULL_35CM"
+                break
             if shifted >= TARGET_SIDE_SHIFT_MAX_M:
-                stop_reason = "MAX_SHIFT_BEFORE_35CM"
+                stop_reason = "ODOM_MAX_GUARD"
                 break
             if now - start_t >= TARGET_SIDE_SHIFT_TIMEOUT_SEC:
-                stop_reason = "TIMEOUT_BEFORE_35CM"
+                stop_reason = "SHIFT_TIMEOUT"
                 break
 
-            # Source ToF is sampled asynchronously at 20 Hz.  For FAST-35 use the
-            # newest valid sample directly: a 3-sample median lagged by several cm
-            # at 0.22 m/s and delayed the 65/32/14 mm speed transitions.
-            latest_mm = self.owner.latest_tof(fresh=True)
-            if latest_mm is not None and TOF_VALID_MIN_MM <= latest_mm <= TOF_VALID_MAX_MM:
-                source_mm = float(latest_mm)
-                tof_hist.append(source_mm)
-            elif tof_hist:
-                source_mm = float(tof_hist[-1])
-            else:
-                source_mm = None
-            token["source_wall_tof_mm"] = source_mm
-            if source_mm is not None and source_mm >= (
-                TARGET_SIDE_SHIFT_SOURCE_GOAL_MM - TARGET_SIDE_SHIFT_SOURCE_GOAL_TOL_MM
-            ):
-                stop_reason = f"{source_side}_TOF_35CM"
-                break
-
-            # IMPORTANT: use fresh ADC samples here.  The normal Sharp median can
-            # lag by multiple control cycles and was the cause of wall contact.
+            # Fresh, unfiltered destination Sharp.  FAR>CAL means safely beyond
+            # the calibrated close-range sensor span, not a missing sensor.
             left_cm, right_cm, la_raw, ra_raw = self.owner.read_sharp_cm_fast(
                 samples=TARGET_SIDE_SHIFT_FAST_SHARP_SAMPLES,
                 interval_sec=TARGET_SIDE_SHIFT_FAST_SHARP_INTERVAL_SEC,
@@ -1932,107 +2120,59 @@ class TargetVisionSubsystem:
             token["dest_sharp_cm"] = dest_cm
 
             if dest_far:
-                # adc_to_cm(None-distance) can simply mean >24 cm, which is safe
-                # for collision purposes.  V20.4 incorrectly aborted these shifts.
                 missing_sharp_cycles = 0
-                hard_close_cycles = 0
             elif dest_cm is None:
                 missing_sharp_cycles += 1
-                hard_close_cycles = 0
                 if missing_sharp_cycles >= TARGET_SIDE_SHIFT_SHARP_MISSING_MAX_CYCLES:
-                    stop_reason = f"{dest_side}_SHARP_TRULY_UNAVAILABLE"
+                    stop_reason = f"{dest_side}_SHARP_UNAVAILABLE"
                     self.owner.safe_stop()
                     break
             else:
                 missing_sharp_cycles = 0
                 if dest_cm <= TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM:
-                    hard_close_cycles += 1
-                else:
-                    hard_close_cycles = 0
-                if hard_close_cycles >= TARGET_SIDE_SHIFT_HARD_STOP_CONFIRM_CYCLES:
-                    stop_reason = f"{dest_side}_SHARP_COLLISION_STOP"
+                    stop_reason = f"{dest_side}_SHARP_EMERGENCY_STOP"
                     self.owner.safe_stop()
                     break
 
-            # V20.6 FAST-35: ONLY the remaining source-ToF distance chooses speed.
-            # Sharp no longer adds 12/8.5/6.5 cm speed tiers -- it is sampled
-            # frequently and acts as a direct emergency STOP.
-            source_gap = None if source_mm is None else max(
-                0.0, TARGET_SIDE_SHIFT_SOURCE_GOAL_MM - float(source_mm)
-            )
-            if source_gap is None:
-                speed_cap = TARGET_SIDE_SHIFT_SLOW_MPS
-            elif source_gap <= TARGET_SIDE_SHIFT_SOURCE_CRAWL_GAP_MM:
-                speed_cap = TARGET_SIDE_SHIFT_CRAWL_MPS      # <=14 mm remaining
-            elif source_gap <= TARGET_SIDE_SHIFT_SOURCE_SLOW_GAP_MM:
-                speed_cap = TARGET_SIDE_SHIFT_SLOW_MPS       # <=32 mm remaining
-            elif source_gap <= TARGET_SIDE_SHIFT_SOURCE_MED_GAP_MM:
-                speed_cap = TARGET_SIDE_SHIFT_MED_SPEED_MPS  # <=65 mm remaining
+            # Exact user-requested four-stage profile, based on *remaining chassis
+            # displacement* rather than wall-ToF distance.
+            if remaining <= TARGET_SIDE_SHIFT_CRAWL_REMAIN_M:
+                speed = TARGET_SIDE_SHIFT_CRAWL_MPS
+            elif remaining <= TARGET_SIDE_SHIFT_SLOW_REMAIN_M:
+                speed = TARGET_SIDE_SHIFT_SLOW_MPS
+            elif remaining <= TARGET_SIDE_SHIFT_MED_REMAIN_M:
+                speed = TARGET_SIDE_SHIFT_MED_SPEED_MPS
             else:
-                speed_cap = TARGET_SIDE_SHIFT_SPEED_MPS      # open part: 0.22 m/s
+                speed = TARGET_SIDE_SHIFT_SPEED_MPS
 
-            # No acceleration staircase: command the selected tier immediately.
-            # This is what removes the slow open-corridor ramp.
-            last_speed = max(0.0, float(speed_cap))
-
-            # Fresh Sharp is checked every ~20 ms (about 50 Hz), but it does NOT
-            # reduce speed early.  The source-ToF tiers above own all normal
-            # deceleration.  Sharp is only the last collision veto at 6.8 cm.
-            # The hard-stop check is already performed above before this command.
-            if dest_cm is None and not dest_far:
-                if missing_sharp_cycles >= TARGET_SIDE_SHIFT_SHARP_MISSING_MAX_CYCLES:
-                    stop_reason = f"{dest_side}_SHARP_TRULY_UNAVAILABLE"
-                    self.owner.safe_stop()
-                    break
-
-            z_cmd = self.owner.yaw_hold_command(token["target_yaw"], stationary=False)
-            ok = self.owner.drive_speed_resilient(
-                x=0.0, y=sign * last_speed, z=z_cmd,
-                timeout=DRIVE_COMMAND_TIMEOUT, label="TARGET SIDE SHIFT",
-            )
-            if not ok:
+            z_cmd = self.owner.lateral_yaw_hold_command(token["target_yaw"])
+            if not self.owner.drive_speed_resilient(
+                x=0.0, y=sign * speed, z=z_cmd,
+                timeout=DRIVE_COMMAND_TIMEOUT, label="TARGET FULL35 SHIFT",
+            ):
                 stop_reason = "DRIVE_COMMAND_FAILED"
                 break
 
-            if now - last_log >= 0.20:
-                source_mm_text = "NA" if source_mm is None else "{:.0f}mm".format(source_mm)
-                dest_cm_text = (
+            if now - last_log >= 0.18:
+                sharp_text = (
                     "FAR>CAL" if dest_far else
-                    ("NA" if dest_cm is None else "{:.1f}cm".format(dest_cm))
+                    ("NA" if dest_cm is None else f"{dest_cm:.1f}cm")
                 )
                 print(
-                    f"[TARGET SHIFT {dest_side}] d={shifted:.3f}m "
-                    f"{source_side}ToF={source_mm_text} "
-                    f"remain={('NA' if source_mm is None else f'{max(0.0, TARGET_SIDE_SHIFT_SOURCE_GOAL_MM-float(source_mm)):.0f}mm')} "
-                    f"{dest_side}SharpFAST={dest_cm_text} "
-                    f"v={last_speed:.3f}m/s hardStop={TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM:.1f}cm"
+                    f"[TARGET FULL35 {dest_side}] d={shifted:.3f}m "
+                    f"remain={remaining*1000:.0f}mm {dest_side}SharpFAST={sharp_text} "
+                    f"v={speed:.3f}m/s"
                 )
                 last_log = now
             time.sleep(TARGET_SIDE_SHIFT_CONTROL_DT)
 
         self.owner.safe_stop()
-        time.sleep(0.08)
-
-        final_source = self.owner.sample_fresh_tof(
-            samples=TARGET_SIDE_SHIFT_TOF_SAMPLES,
-            timeout=TARGET_SIDE_SHIFT_TOF_TIMEOUT_SEC,
-        )
-        if final_source is not None:
-            token["source_wall_tof_mm"] = final_source
-        left_cm, right_cm, _la, _ra = self.owner.read_sharp_cm_fast(
-            samples=TARGET_SIDE_SHIFT_FAST_SHARP_SAMPLES,
-            interval_sec=TARGET_SIDE_SHIFT_FAST_SHARP_INTERVAL_SEC,
-        )
-        dest_cm = right_cm if sign > 0 else left_cm
-        token["dest_sharp_cm"] = dest_cm
+        # No extra ToF sample/settle here: the following sweep already validates
+        # the gimbal pose and the camera thread is continuously live.
         token["result"] = stop_reason
-        source_tof_value = token["source_wall_tof_mm"]
-        source_tof_text = "NA" if source_tof_value is None else "{:.0f}mm".format(source_tof_value)
-        dest_sharp_text = "NA" if dest_cm is None else "{:.1f}cm".format(dest_cm)
         print(
-            f"[TARGET SHIFT DONE] dir={direction} shift={token['shift_m']:.3f}m "
-            f"{source_side}ToF={source_tof_text} "
-            f"{dest_side}SharpFAST={dest_sharp_text} result={stop_reason}"
+            f"[TARGET FULL35 DONE] dir={direction} shift={token['shift_m']:.3f}m "
+            f"destSharp={token.get('dest_sharp_cm')} result={stop_reason}"
         )
         return token
 
@@ -2303,7 +2443,7 @@ class TargetVisionSubsystem:
         return False
 
     def _return_to_sector_anchor(self, token):
-        """Return a temporary side-sector strafe to its original node anchor."""
+        """Fast return over the just-proven side-shift path."""
         if not isinstance(token, dict):
             return True
         anchor = token.get("anchor_pos")
@@ -2315,6 +2455,7 @@ class TargetVisionSubsystem:
         self.owner.pid_straight.reset()
         deadline = time.monotonic() + TARGET_SIDE_SHIFT_RETURN_TIMEOUT_SEC
         last_log = 0.0
+        missing = 0
 
         while self.owner.running and self.running and time.monotonic() < deadline:
             pos = self.owner.current_position()
@@ -2322,64 +2463,79 @@ class TargetVisionSubsystem:
                 break
             lat = float(self.owner.cell_lateral_offset(anchor, pos, target_yaw))
             fwd = float(self.owner.cell_forward_progress(anchor, pos, target_yaw))
-            if abs(lat) <= TARGET_SIDE_SHIFT_RETURN_LAT_TOL_M:
+            remaining = abs(lat)
+
+            if remaining <= TARGET_SIDE_SHIFT_RETURN_LAT_TOL_M:
                 self.owner.safe_stop()
-                self.owner.align_heading_stationary(
-                    target_yaw, timeout_sec=0.8,
-                    tolerance_deg=max(0.55, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.07,
-                )
+                yaw_err = self.owner.yaw_error_deg(target_yaw)
+                # Do not burn ~0.5-0.8 s settling a yaw that is already good; the
+                # next sector/move has its own cardinal verification.
+                if yaw_err is None or abs(yaw_err) > 1.35:
+                    self.owner.align_heading_stationary(
+                        target_yaw, timeout_sec=0.40,
+                        tolerance_deg=max(0.85, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.035,
+                    )
                 ok = abs(fwd) <= TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M
                 print(
-                    f"[TARGET ANCHOR RETURN] lat={lat:+.3f}m fwd={fwd:+.3f}m "
+                    f"[TARGET ANCHOR FAST RETURN] lat={lat:+.3f}m fwd={fwd:+.3f}m "
                     f"-> {'OK' if ok else 'LATERAL_OK/FWD_DRIFT'}"
                 )
                 return True
 
-            y_cmd = clamp(
-                -1.8 * lat,
-                -TARGET_SIDE_SHIFT_RETURN_SPEED_MPS,
-                +TARGET_SIDE_SHIFT_RETURN_SPEED_MPS,
-            )
-            if 0.0 < abs(y_cmd) < TARGET_SIDE_SHIFT_CRAWL_MPS:
-                y_cmd = math.copysign(TARGET_SIDE_SHIFT_CRAWL_MPS, y_cmd)
+            if remaining <= TARGET_SIDE_SHIFT_RETURN_SLOW_ZONE_M:
+                speed = TARGET_SIDE_SHIFT_RETURN_SLOW_MPS
+            elif remaining <= TARGET_SIDE_SHIFT_RETURN_MED_ZONE_M:
+                speed = TARGET_SIDE_SHIFT_RETURN_MED_SPEED_MPS
+            else:
+                speed = TARGET_SIDE_SHIFT_RETURN_SPEED_MPS
+            y_cmd = math.copysign(speed, -lat)
 
-            # Return motion can hit the opposite wall too.  Use the same fresh,
-            # conservative Sharp path and progressively cap lateral speed.
-            left_cm, right_cm, _la, _ra = self.owner.read_sharp_cm_fast(
+            left_cm, right_cm, la_raw, ra_raw = self.owner.read_sharp_cm_fast(
                 samples=TARGET_SIDE_SHIFT_FAST_SHARP_SAMPLES,
                 interval_sec=TARGET_SIDE_SHIFT_FAST_SHARP_INTERVAL_SEC,
             )
             dest_cm = right_cm if y_cmd > 0 else left_cm
-            if dest_cm is None:
-                # Return is required to restore the map anchor, so do not abort on
-                # one missing sample; use a moderate cap until Sharp comes back.
-                y_cmd = math.copysign(min(abs(y_cmd), 0.080), y_cmd)
+            dest_raw = ra_raw if y_cmd > 0 else la_raw
+            dest_cal = RIGHT_CAL if y_cmd > 0 else LEFT_CAL
+            dest_far = (dest_cm is None and sharp_raw_means_far(dest_raw, dest_cal))
+            if dest_far:
+                missing = 0
+            elif dest_cm is None:
+                missing += 1
+                # Returning to anchor is required; tolerate one missing callback,
+                # then reduce rather than blindly keeping 0.38 m/s.
+                if missing >= 2:
+                    y_cmd = math.copysign(min(abs(y_cmd), 0.10), y_cmd)
             else:
+                missing = 0
                 if dest_cm <= TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM:
                     self.owner.safe_stop()
                     print(
                         f"[TARGET ANCHOR RETURN BLOCK] y={y_cmd:+.3f} "
-                        f"destSharpFAST={dest_cm:.1f}cm hardStop={TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM:.1f}cm"
+                        f"destSharpFAST={dest_cm:.1f}cm"
                     )
                     break
 
-            z_cmd = self.owner.yaw_hold_command(target_yaw, stationary=False)
+            z_cmd = self.owner.lateral_yaw_hold_command(target_yaw)
             if not self.owner.drive_speed_resilient(
                 x=0.0, y=y_cmd, z=z_cmd,
-                timeout=DRIVE_COMMAND_TIMEOUT, label="TARGET ANCHOR RETURN",
+                timeout=DRIVE_COMMAND_TIMEOUT, label="TARGET FAST ANCHOR RETURN",
             ):
                 break
 
             now = time.monotonic()
-            if now - last_log >= 0.30:
-                print(f"[TARGET ANCHOR RETURN] lat={lat:+.3f}m fwd={fwd:+.3f}m")
+            if now - last_log >= 0.20:
+                print(
+                    f"[TARGET ANCHOR FAST RETURN] lat={lat:+.3f}m "
+                    f"remain={remaining:.3f}m v={abs(y_cmd):.2f}m/s"
+                )
                 last_log = now
             time.sleep(TARGET_SIDE_SHIFT_CONTROL_DT)
 
         self.owner.safe_stop()
         pos = self.owner.current_position(fresh=False)
         if pos is None:
-            self.owner.fault("TARGET ANCHOR", "position unavailable after side scan", "continue from stopped pose")
+            self.owner.fault("TARGET ANCHOR", "return ended without position", "continue cautiously")
             return False
         lat = float(self.owner.cell_lateral_offset(anchor, pos, target_yaw))
         fwd = float(self.owner.cell_forward_progress(anchor, pos, target_yaw))
@@ -2387,14 +2543,16 @@ class TargetVisionSubsystem:
             abs(lat) <= TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M
             and abs(fwd) <= TARGET_SIDE_SHIFT_RETURN_SOFT_TOL_M
         )
-        self.owner.align_heading_stationary(
-            target_yaw, timeout_sec=0.9,
-            tolerance_deg=max(0.70, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.07,
-        )
+        yaw_err = self.owner.yaw_error_deg(target_yaw)
+        if yaw_err is None or abs(yaw_err) > 1.35:
+            self.owner.align_heading_stationary(
+                target_yaw, timeout_sec=0.40,
+                tolerance_deg=max(0.85, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.035,
+            )
         if soft:
             self.owner.fault(
                 "TARGET ANCHOR",
-                f"return ended in soft tolerance lat={lat:+.3f}m fwd={fwd:+.3f}m",
+                f"fast return soft tolerance lat={lat:+.3f}m fwd={fwd:+.3f}m",
                 "accept node and continue",
             )
             return True
@@ -2404,6 +2562,62 @@ class TargetVisionSubsystem:
             "remain stopped; DFS will re-align before translation",
         )
         return False
+
+    def _candidate_probably_already_fired(self, candidate, detect_yaw):
+        """Cheap pre-AIM check for a previously fired physical target.
+
+        Prefer estimated world position using the currently-fresh gimbal ToF.
+        Fall back to same-cell absolute bearing only.  Shape is intentionally
+        ignored because oblique views can change SQUARE <-> RECT classification.
+        """
+        color = str(candidate.get("color") or "").upper()
+        if not color:
+            return None
+        current_cell = tuple(self.owner.current)
+        abs_bearing = wrap_deg(float(self.owner.heading) * 90.0 + float(detect_yaw))
+
+        # Use the latest ToF without waiting for another multi-sample range read.
+        est_xy = None
+        tof_now = self.owner.latest_tof(fresh=True)
+        if tof_now is not None:
+            try:
+                est_xy, _ = self._estimate_position(float(tof_now))
+            except Exception:
+                est_xy = None
+
+        for old in self.targets:
+            if str(old.get("color") or "").upper() != color:
+                continue
+            cand_shape = str(candidate.get("shape") or "").upper()
+            old_shape = str(old.get("shape") or "").upper()
+            rect_family = {"SQUARE", "RECT_HORIZONTAL", "RECT_VERTICAL"}
+            if cand_shape != old_shape and not (cand_shape in rect_family and old_shape in rect_family):
+                continue
+            if not (
+                str(old.get("fire_status") or "").startswith("FIRED_")
+                or str(old.get("id") or "") in self.fired_target_ids
+            ):
+                continue
+
+            old_xy = old.get("estimated_grid_xy")
+            if est_xy is not None and old_xy is not None:
+                try:
+                    if math.hypot(
+                        float(est_xy[0]) - float(old_xy[0]),
+                        float(est_xy[1]) - float(old_xy[1]),
+                    ) <= TARGET_FAST_FIRED_GRID_DIST:
+                        return old
+                except Exception:
+                    pass
+
+            old_cell = tuple(old.get("source_cell", ()))
+            old_b = old.get("detected_bearing_deg_from_north")
+            if old_b is None:
+                old_b = old.get("bearing_deg_from_north")
+            if old_cell == current_cell and old_b is not None:
+                if angle_diff_deg(float(old_b), abs_bearing) <= TARGET_FAST_FIRED_SAME_CELL_BEARING_DEG:
+                    return old
+        return None
 
     def _candidate_suppressed_in_sector(self, candidate, yaw_now, handled):
         for item in handled:
@@ -2415,7 +2629,11 @@ class TargetVisionSubsystem:
                     color,shape,sweep_yaw=item[:3]; radius=TARGET_SWEEP_REPEAT_SUPPRESS_DEG
                 except Exception:
                     continue
-            if color != candidate.get("color") or shape != candidate.get("shape"):
+            if color != candidate.get("color"):
+                continue
+            if isinstance(item, dict) and item.get("ignore_shape"):
+                pass
+            elif shape != candidate.get("shape"):
                 continue
             if sweep_yaw is not None and yaw_now is not None:
                 if angle_diff_deg(float(sweep_yaw), float(yaw_now)) <= float(radius):
@@ -2429,7 +2647,7 @@ class TargetVisionSubsystem:
         interrupts = 0
         direction = +1.0 if end_yaw >= start_yaw else -1.0
 
-        if not self._goto_target_pose_strict(start_yaw, TARGET_SEARCH_PITCH_DEG, timeout_sec=1.25, allow_soft=True):
+        if not self._goto_target_pose_strict(start_yaw, TARGET_SEARCH_PITCH_DEG, timeout_sec=0.80, allow_soft=True):
             self.owner.fault(
                 "TARGET SWEEP",
                 f"{sector_name}: cannot reach start yaw={start_yaw:+.1f}",
@@ -2469,10 +2687,28 @@ class TargetVisionSubsystem:
                     if self._candidate_suppressed_in_sector(candidate, y_now, handled):
                         gate_since = time.monotonic()
                     else:
-                        self._stop_gimbal_velocity()
-                        service_started = time.monotonic()
                         candidate = dict(candidate)
                         detect_yaw = float(y_now)
+                        old_fired = self._candidate_probably_already_fired(candidate, detect_yaw)
+                        if old_fired is not None:
+                            print(
+                                f"[TARGET FAST SKIP FIRED] {old_fired.get('id')} "
+                                f"{candidate.get('color')} detectYaw={detect_yaw:+.1f} "
+                                f"shapeNow={candidate.get('shape')} -> keep sweeping"
+                            )
+                            handled.append({
+                                "color": candidate.get("color"),
+                                "shape": candidate.get("shape"),
+                                "sweep_yaw": detect_yaw,
+                                "radius": max(32.0, TARGET_SWEEP_REPEAT_SUPPRESS_DEG),
+                                "ignore_shape": True,
+                            })
+                            gate_since = time.monotonic()
+                            time.sleep(TARGET_SWEEP_CONTROL_DT)
+                            continue
+
+                        self._stop_gimbal_velocity()
+                        service_started = time.monotonic()
                         acquisition_cone = (float(fire_lo), float(fire_hi))
                         preferred_cone = self._sector_preferred_fire_cone(sector_name)
                         aim_envelope = self._sector_aim_envelope(sector_name)
@@ -2492,6 +2728,8 @@ class TargetVisionSubsystem:
                         )
 
                         locked = None
+                        fire_record = None
+                        fire_success = False
                         if not shoot_intent:
                             # Outside the narrow +/-10deg acquisition cone: keep
                             # the target in memory, but do not spend time dragging
@@ -2542,25 +2780,43 @@ class TargetVisionSubsystem:
                                 if record is not None:
                                     if not any(r.get("id") == record.get("id") for r in found if isinstance(r, dict)):
                                         found.append(record)
-                                    self._maybe_fire(
+                                    fire_record = record
+                                    fire_success = bool(self._maybe_fire(
                                         record,
                                         sector_name=sector_name,
                                         fire_cone=acquisition_cone,
-                                    )
+                                    ))
 
                         interrupts += 1
                         # Suppress around the ORIGINAL sweep bearing.  Auto-Aim
                         # may rotate tens of degrees, so its final lock yaw must
                         # never become the sweep-progress coordinate.
+                        fire_status = (
+                            str(fire_record.get("fire_status") or "")
+                            if isinstance(fire_record, dict) else ""
+                        )
+                        if fire_success or fire_status.startswith("FIRED_"):
+                            suppress_radius = TARGET_SWEEP_REPEAT_SUPPRESS_DEG
+                        elif fire_status == "DEFER_BAD_ANGLE":
+                            # Critical: do NOT burn the good-angle opportunity.
+                            # Skip only the immediate duplicate frames around the
+                            # same bearing, then allow reacquisition farther along.
+                            suppress_radius = TARGET_BAD_ANGLE_RETRY_SUPPRESS_DEG
+                        elif locked is not None:
+                            suppress_radius = TARGET_SWEEP_FAIL_SUPPRESS_DEG
+                        elif not shoot_intent:
+                            suppress_radius = TARGET_SWEEP_REPEAT_SUPPRESS_DEG
+                        else:
+                            suppress_radius = TARGET_SWEEP_FAIL_SUPPRESS_DEG
+
                         handled.append({
                             "color": candidate.get("color"),
                             "shape": candidate.get("shape"),
                             "sweep_yaw": detect_yaw,
-                            "radius": (
-                                TARGET_SWEEP_REPEAT_SUPPRESS_DEG
-                                if (locked is not None or not shoot_intent)
-                                else TARGET_SWEEP_FAIL_SUPPRESS_DEG
-                            ),
+                            "radius": suppress_radius,
+                            # Once it has been locked, perspective may flip
+                            # SQUARE <-> RECT while the sweep continues.
+                            "ignore_shape": bool(fire_status == "DEFER_BAD_ANGLE"),
                         })
 
                         if interrupts >= TARGET_SWEEP_MAX_INTERRUPTS_PER_SECTOR:
@@ -2574,7 +2830,7 @@ class TargetVisionSubsystem:
                         if direction * (float(end_yaw) - resume_yaw) <= 1.5:
                             break
                         self._goto_target_pose_strict(
-                            resume_yaw, TARGET_SEARCH_PITCH_DEG, timeout_sec=0.85, allow_soft=True
+                            resume_yaw, TARGET_SEARCH_PITCH_DEG, timeout_sec=0.55, allow_soft=True
                         )
                         # Target lock / verification time must not consume the
                         # sector's continuous-sweep watchdog budget.
@@ -2657,15 +2913,15 @@ class TargetVisionSubsystem:
         dead_end_front_shift = self._is_confirmed_dead_end_cell(cell)
         dead_end_note = " DEADEND-FRONT-BACKSHIFT=35cm" if dead_end_front_shift else ""
         print(
-            f"\n[TARGET 3-SECTOR CONTINUOUS] cell={cell} "
+            f"\n[TARGET 3-SECTOR FAST35] cell={cell} "
             f"pitch={TARGET_SEARCH_PITCH_DEG:+.0f}deg "
             f"LEFT(-110..-45) FRONT(-45..+45) RIGHT(+45..+110)"
             f"{dead_end_note}"
         )
 
-        # Put the turret in a known forward/down pose before any temporary
-        # mecanum side shift.  The actual sector sweep starts only afterwards.
-        self._goto_target_pose_strict(0.0, TARGET_SEARCH_PITCH_DEG, timeout_sec=0.85, allow_soft=True)
+        # V20.7: no redundant FRONT pose before LEFT.  Side shift overlaps the
+        # gimbal move toward that sector's start angle, saving one mechanical
+        # positioning wait per cell.
 
         try:
             for sector_name, start_yaw, end_yaw, slide_dir, fire_lo, fire_hi in TARGET_RADAR_SECTORS:
@@ -2690,7 +2946,7 @@ class TargetVisionSubsystem:
                 }
                 front_backshift_token = None
                 if slide_dir is not None:
-                    token = self._temporary_side_shift(slide_dir, anchor_pos=cell_anchor)
+                    token = self._temporary_side_shift(slide_dir, anchor_pos=cell_anchor, preposition_yaw=start_yaw)
                 elif sector_name == "FRONT" and dead_end_front_shift:
                     front_backshift_token = self._temporary_deadend_front_backshift(
                         cell, anchor_pos=cell_anchor
@@ -2718,10 +2974,10 @@ class TargetVisionSubsystem:
                     yaw_before = self.owner.yaw_error_deg(heading_yaw)
                     # V20: turret reaction is usually tiny.  Only stop for a chassis
                     # re-align when it actually exceeds the competition tolerance.
-                    if yaw_before is None or abs(yaw_before) > PRE_MOVE_ALIGN_TOL_DEG:
+                    if yaw_before is None or abs(yaw_before) > TARGET_CHASSIS_REALIGN_TRIGGER_DEG:
                         self.owner.align_heading_stationary(
-                            heading_yaw, timeout_sec=0.65,
-                            tolerance_deg=max(0.70, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.05,
+                            heading_yaw, timeout_sec=TARGET_CHASSIS_REALIGN_TIMEOUT_SEC,
+                            tolerance_deg=max(0.90, PRE_MOVE_ALIGN_TOL_DEG), settle_sec=0.035,
                         )
                     yaw_after = self.owner.yaw_error_deg(heading_yaw)
                     print(
@@ -2731,7 +2987,7 @@ class TargetVisionSubsystem:
 
             self.scanned_cells.add(cell)
             target_scan_sec = time.monotonic() - target_scan_started
-            self.status = f"3-SECTOR DONE cell={cell} found={len(found)} t={target_scan_sec:.1f}s"
+            self.status = f"3-SECTOR 9MIN cell={cell} found={len(found)} t={target_scan_sec:.1f}s"
             print(f"[PERF TARGET SCAN] cell={cell} sec={target_scan_sec:.2f} found={len(found)}")
             self.save_targets()
             return found
@@ -2912,7 +3168,16 @@ class TargetVisionSubsystem:
 
     @staticmethod
     def _same_identity(a,b):
-        return a.get("color")==b.get("color") and a.get("shape")==b.get("shape")
+        # V20.7: perspective can turn the same SQUARE into a horizontal/vertical
+        # RECT, but a CIRCLE should never merge with that rectangular family.
+        if a.get("color") != b.get("color"):
+            return False
+        sa = str(a.get("shape") or "").upper()
+        sb = str(b.get("shape") or "").upper()
+        if sa == sb:
+            return True
+        rect_family = {"SQUARE", "RECT_HORIZONTAL", "RECT_VERTICAL"}
+        return sa in rect_family and sb in rect_family
 
     def _find_duplicate(self,record):
         for old in self.targets:
@@ -3040,6 +3305,8 @@ class TargetVisionSubsystem:
                 "preferred_acquisition_cone_deg", "detected_in_preferred_cone",
                 "soft_acquisition", "detected_in_acquisition_cone", "shoot_intent",
                 "aim_envelope_deg", "in_aim_envelope",
+                "good_fire_cone_deg", "good_fire_angle",
+                "deferred_lock_yaw_deg", "deferred_fire_pose_yaw_deg",
                 "crosshair_centered", "crosshair_error_norm",
             ):
                 if rec.get(k) is not None:
@@ -3569,6 +3836,29 @@ class TargetVisionSubsystem:
             self.save_targets()
             return False
 
+        # V20.7 GOOD-ANGLE FIRE: wide detection/aim is useful for remembering
+        # targets, but a water shot from a steep oblique angle is not.  Gate on
+        # the FINAL lock yaw (not detectYaw) so Auto-Aim cannot drag a candidate
+        # from a good detection bearing into a bad physical firing bearing.
+        good_fire_cone = self._sector_good_fire_cone(sector)
+        good_fire_angle = self._yaw_in_cone(yaw_now, good_fire_cone)
+        record["good_fire_cone_deg"] = (
+            None if good_fire_cone is None
+            else [float(good_fire_cone[0]), float(good_fire_cone[1])]
+        )
+        record["good_fire_angle"] = bool(good_fire_angle)
+        if not good_fire_angle:
+            record["fire_status"] = "DEFER_BAD_ANGLE"
+            record["deferred_lock_yaw_deg"] = yaw_now
+            self.last_fire_event = "{} DEFER: BAD ANGLE {}".format(tid, fmt_deg(yaw_now))
+            print(
+                "[FIRE DEFER ANGLE] {}: {} lockYaw={} outside GOOD={} -> NO SHOT; keep target alive for a better view".format(
+                    tid, sector, fmt_deg(yaw_now), record["good_fire_cone_deg"]
+                )
+            )
+            self.save_targets()
+            return False
+
         # V15 CENTER-ONLY: BBOX centre must sit on the camera crosshair for
         # 3 consecutive frames. Upper-target bias is disabled; range/parallax
         # compensation begins immediately after the centre lock.
@@ -3694,6 +3984,27 @@ class TargetVisionSubsystem:
             record["fire_status"] = "BLOCKED_FIRE_TYPE_UNAVAILABLE"
             self.last_fire_event = "{} BLOCKED: {} API unavailable".format(tid, fire_mode)
             print("[FIRE BLOCK] {}: {} constant unavailable in RoboMaster SDK".format(tid, fire_mode))
+            return False
+
+        # Re-check the ACTUAL yaw after fire-pose compensation.  Pitch
+        # compensation should not change yaw, but feedback drift/coupling can.
+        # Never let such drift turn a previously good lock into an oblique shot.
+        _p_fire_now, y_fire_now = self.owner.current_gimbal_relative()
+        good_fire_cone = self._sector_good_fire_cone(sector)
+        if not self._yaw_in_cone(y_fire_now, good_fire_cone):
+            record["fire_status"] = "DEFER_BAD_ANGLE"
+            record["deferred_fire_pose_yaw_deg"] = y_fire_now
+            record["good_fire_cone_deg"] = (
+                None if good_fire_cone is None
+                else [float(good_fire_cone[0]), float(good_fire_cone[1])]
+            )
+            self.last_fire_event = "{} DEFER: FIRE POSE ANGLE {}".format(tid, fmt_deg(y_fire_now))
+            print(
+                "[FIRE DEFER ANGLE] {}: finalFireYaw={} outside GOOD={} after compensation -> NO SHOT".format(
+                    tid, fmt_deg(y_fire_now), record["good_fire_cone_deg"]
+                )
+            )
+            self.save_targets()
             return False
 
         actual_shots = 0
@@ -3833,10 +4144,10 @@ class TargetVisionSubsystem:
                 ],
                 "side_shift":{
                     "enabled":bool(TARGET_SIDE_SHIFT_ENABLED),
-                    "source_wall_goal_mm":float(TARGET_SIDE_SHIFT_SOURCE_GOAL_MM),
+                    "viewpoint_shift_m":float(TARGET_SIDE_SHIFT_DISTANCE_M),
                     "destination_sharp_hard_stop_cm":float(TARGET_SIDE_SHIFT_DEST_HARD_STOP_CM),
                     "max_shift_m":float(TARGET_SIDE_SHIFT_MAX_M),
-                    "policy":"source-side ToF to ~35cm; destination Sharp 6cm collision stop",
+                    "policy":"odometry ~35cm viewpoint shift; fresh Sharp emergency stop",
                 },
                 "foam_gate":{
                     "enabled":bool(TARGET_FOAM_GATE_ENABLED),"fail_closed":bool(TARGET_FOAM_FAIL_CLOSED),
@@ -3928,6 +4239,15 @@ def angle_diff_deg(a, b):
 def neighbor(cell, direction):
     dx, dy = DIR_VEC[int(direction) % 4]
     return (cell[0] + dx, cell[1] + dy)
+
+
+def cell_in_field(cell):
+    """True only for logical cells inside the currently configured arena."""
+    try:
+        x, y = int(cell[0]), int(cell[1])
+    except Exception:
+        return False
+    return GRID_X_MIN <= x <= GRID_X_MAX and GRID_Y_MIN <= y <= GRID_Y_MAX
 
 
 def direction_between(a, b):
@@ -4149,8 +4469,12 @@ class DFSMapOnlyExplorer:
         self.target_selection = set(TARGET_FILTER_ALL)
         self.mission_mode = "ROUND1"
         self.round1_memory = None
+        self.round1_memory_path = Path(ROUND1_ATTACK_MEMORY_JSON)
         self.round2_hints = []
         self.round2_result = {}
+        # GUI-only/pre-run planner cache.  This is computed entirely from the
+        # frozen Round-1 snapshot, so Preview never needs a robot connection.
+        self.round2_preview_plan = {}
         self.cleanup_done = False
         self.running = True
         self.connected = False
@@ -4169,7 +4493,7 @@ class DFSMapOnlyExplorer:
         self.gimbal_zero_yaw_raw = None
 
         self.heading = 0
-        self.root = (0, 0)
+        self.root = tuple(ROOT_CELL)
         self.current = self.root
         self.visited = set()
         self.parent = {}
@@ -4181,12 +4505,23 @@ class DFSMapOnlyExplorer:
         # Remembering that distance makes the reverse/backtrack traversal use the
         # same physical anchor instead of blindly overshooting by 60 cm.
         self.edge_travel_m = {}   # ((cell), dir) -> metres
+        # BREADCRUMB = chronological, confirmed cell-to-cell motion.  The graph
+        # says where the robot CAN go; this trail says where it ACTUALLY went.
+        self.breadcrumb_lock = threading.Lock()
+        self.breadcrumb_trail = []
+        self.breadcrumb_seq = 0
         self.last_move_distance_m = None
         self.last_stop_probe = None
         self.edge_failures = {}
         self.turn_failures = {}
         self.deferred_edges = set()
         self.unknown_rescan_counts = {}
+        # Cells that look like the outside/fake-exit apron.  The legacy heuristic
+        # is disabled when configured bounds are authoritative; boundary rejection
+        # then happens before movement.
+        self.fake_exit_candidates = set()
+        self.fake_exit_rejected_edges = set()
+        self.boundary_rejected_edges = set()
         self.map_complete = False
         self.map_created_at = datetime.now().isoformat(timespec="seconds")
 
@@ -4218,6 +4553,47 @@ class DFSMapOnlyExplorer:
         # Set only after an actual 90/180 chassis turn.  The next edge may use
         # the angled IR whiskers to trim itself through a doorway/corner.
         self.ir_corner_trim_pending = False
+
+        # Live chassis-speed telemetry for GUI. Commanded speed is updated after
+        # an accepted drive_speed() call; measured speed is estimated from odometry.
+        self.speed_telemetry_lock = threading.Lock()
+        self.last_drive_command = {
+            "x": 0.0, "y": 0.0, "z": 0.0, "label": "STOP", "t": time.monotonic()
+        }
+        self.odom_velocity = {
+            "vx": 0.0, "vy": 0.0, "speed": 0.0, "t": time.monotonic()
+        }
+        self._speed_prev_position = None
+        self.active_motion_profile_name = "IDLE"
+
+    def _set_drive_command_telemetry(self, x, y, z, label):
+        with self.speed_telemetry_lock:
+            self.last_drive_command = {
+                "x": float(x), "y": float(y), "z": float(z),
+                "label": str(label or "DRIVE"), "t": time.monotonic(),
+            }
+
+    def speed_snapshot(self):
+        """Return commanded + odometry-estimated speed for the live GUI."""
+        with self.speed_telemetry_lock:
+            cmd = dict(self.last_drive_command)
+            odom = dict(self.odom_velocity)
+        vx = float(odom.get("vx", 0.0)); vy = float(odom.get("vy", 0.0))
+        d = int(self.heading) % 4
+        fx, fy = DIR_VEC[d]
+        rx, ry = DIR_VEC[(d + 1) % 4]
+        return {
+            "command_x": float(cmd.get("x", 0.0)),
+            "command_y": float(cmd.get("y", 0.0)),
+            "command_z": float(cmd.get("z", 0.0)),
+            "command_speed": math.hypot(float(cmd.get("x", 0.0)), float(cmd.get("y", 0.0))),
+            "command_label": str(cmd.get("label", "-")),
+            "actual_vx": vx, "actual_vy": vy,
+            "actual_forward": vx * fx + vy * fy,
+            "actual_right": vx * rx + vy * ry,
+            "actual_speed": float(odom.get("speed", 0.0)),
+            "profile": str(self.active_motion_profile_name),
+        }
 
     def set_fire_mode(self, mode):
         mode = str(mode or "INFRARED").upper().strip()
@@ -4288,6 +4664,116 @@ class DFSMapOnlyExplorer:
         with self.target_filter_lock:
             return key in self.target_selection
 
+    def reset_map_for_fresh_round1(self):
+        """Clear any preloaded Round-2 snapshot before a brand-new Round 1."""
+        if self.connected:
+            return False
+        self.heading = 0
+        self.root = tuple(ROOT_CELL)
+        self.current = self.root
+        self.visited = set()
+        self.parent = {}
+        self.open_dirs = {}
+        self.edge_state = {}
+        self.cell_scan_mm = {}
+        self.edge_travel_m = {}
+        with self.breadcrumb_lock:
+            self.breadcrumb_trail = []
+            self.breadcrumb_seq = 0
+        self.last_move_distance_m = None
+        self.last_stop_probe = None
+        self.edge_failures = {}
+        self.turn_failures = {}
+        self.deferred_edges = set()
+        self.unknown_rescan_counts = {}
+        self.fake_exit_candidates = set()
+        self.fake_exit_rejected_edges = set()
+        self.boundary_rejected_edges = set()
+        self.map_complete = False
+        self.map_created_at = datetime.now().isoformat(timespec="seconds")
+        self.round1_memory = None
+        self.round1_memory_path = Path(ROUND1_ATTACK_MEMORY_JSON)
+        self.round2_hints = []
+        self.round2_preview_plan = {}
+        self.safe_pause_reason = None
+        return True
+
+    # --------------------------------------------------------
+    # BREADCRUMB / PHYSICAL TRAVEL HISTORY
+    # --------------------------------------------------------
+    def breadcrumb_snapshot(self):
+        """Thread-safe copy for autosave/GUI without blocking mission control."""
+        with self.breadcrumb_lock:
+            return [dict(row) for row in self.breadcrumb_trail]
+
+    def _record_breadcrumb(self, source_cell, abs_dir, motion_profile, distance_m=None):
+        """Record ONE confirmed cell-to-cell arrival, including backtracks.
+
+        Only MOVE_ARRIVED is recorded.  Failed mid-edge excursions are deliberately
+        excluded so the breadcrumb remains a trustworthy sequence of logical anchors.
+        """
+        source = tuple(source_cell)
+        d = int(abs_dir) % 4
+        dest = neighbor(source, d)
+        try:
+            dist = float(distance_m if distance_m is not None else self.last_move_distance_m)
+            if not math.isfinite(dist):
+                raise ValueError
+        except Exception:
+            learned = self.remembered_edge_distance(source, d)
+            dist = float(learned if learned is not None else CELL_LENGTH_M)
+        profile_name = str((motion_profile or {}).get("name") if isinstance(motion_profile, dict) else motion_profile or "EXPLORE").upper()
+        if self.mission_mode == "ROUND2":
+            move_kind = "ROUND2_SHORTEST"
+        elif profile_name == "EXPLORE":
+            move_kind = "EXPLORE_NEW_EDGE"
+        elif "BACKTRACK" in profile_name:
+            move_kind = "DFS_BACKTRACK"
+        else:
+            move_kind = "KNOWN_ROUTE_RELOCATION"
+        with self.breadcrumb_lock:
+            self.breadcrumb_seq += 1
+            row = {
+                "seq": int(self.breadcrumb_seq),
+                "time": datetime.now().isoformat(timespec="milliseconds"),
+                "mission_mode": str(self.mission_mode),
+                "kind": move_kind,
+                "profile": profile_name,
+                "from": [int(source[0]), int(source[1])],
+                "to": [int(dest[0]), int(dest[1])],
+                "dir": DIR_NAMES[d],
+                "dir_index": d,
+                "distance_m": round(float(dist), 4),
+            }
+            self.breadcrumb_trail.append(row)
+        print(
+            "[BREADCRUMB #{:03d}] {} -> {} dir={} profile={} d={:.3f}m mode={}".format(
+                row["seq"], source, dest, row["dir"], profile_name, dist, self.mission_mode
+            )
+        )
+        return row
+
+    def save_breadcrumb(self):
+        try:
+            trail = self.breadcrumb_snapshot()
+            payload = {
+                "schema": "robomaster_breadcrumb_trail",
+                "version": 1,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(trail),
+                "root": [int(self.root[0]), int(self.root[1])],
+                "current": [int(self.current[0]), int(self.current[1])],
+                "trail": trail,
+            }
+            atomic_write_text(
+                BREADCRUMB_LATEST_JSON,
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            return True
+        except Exception as exc:
+            self.fault("BREADCRUMB SAVE", f"{type(exc).__name__}: {exc}", "keep trail in RAM/map bundle")
+            return False
+
     # --------------------------------------------------------
     # LOGGING / SAFE CALLS
     # --------------------------------------------------------
@@ -4302,6 +4788,7 @@ class DFSMapOnlyExplorer:
         print(f"[SOFT FAULT] {msg}")
 
     def safe_stop(self):
+        self._set_drive_command_telemetry(0.0, 0.0, 0.0, "STOP")
         if self.chassis is None:
             return
         try:
@@ -4324,6 +4811,20 @@ class DFSMapOnlyExplorer:
                 self.chassis.drive_speed(
                     x=float(x), y=float(y), z=float(z), timeout=float(timeout)
                 )
+                self._set_drive_command_telemetry(x, y, z, label)
+                label_u = str(label or "").upper()
+                if "TARGET" in label_u:
+                    self.active_motion_profile_name = "TARGET_SHIFT"
+                elif "IR+SHARP" in label_u or "IR " in label_u:
+                    self.active_motion_profile_name = "IR_RECOVERY"
+                elif "SHARP" in label_u and "MOVE" not in label_u:
+                    self.active_motion_profile_name = "SHARP_RECOVERY"
+                elif "RETREAT" in label_u:
+                    self.active_motion_profile_name = "RETREAT"
+                elif "TURN" in label_u:
+                    self.active_motion_profile_name = "TURN"
+                elif "YAW ALIGN" in label_u:
+                    self.active_motion_profile_name = "YAW_ALIGN"
                 return True
             except Exception as exc:
                 self.fault(
@@ -4507,7 +5008,29 @@ class DFSMapOnlyExplorer:
             if self.position_origin_raw is None:
                 self.position_origin_raw = raw
             ox, oy, oz = self.position_origin_raw
-            self.state.set_position((raw[0] - ox, raw[1] - oy, raw[2] - oz))
+            logical_pos = (raw[0] - ox, raw[1] - oy, raw[2] - oz)
+            self.state.set_position(logical_pos)
+
+            now = time.monotonic()
+            prev = self._speed_prev_position
+            if prev is not None:
+                pt, pp = prev
+                dt = now - float(pt)
+                if 0.015 <= dt <= 0.50:
+                    vx = (float(logical_pos[0]) - float(pp[0])) / dt
+                    vy = (float(logical_pos[1]) - float(pp[1])) / dt
+                    speed = math.hypot(vx, vy)
+                    if math.isfinite(speed) and speed <= 2.5:
+                        with self.speed_telemetry_lock:
+                            a = 0.38
+                            old_vx = float(self.odom_velocity.get("vx", 0.0))
+                            old_vy = float(self.odom_velocity.get("vy", 0.0))
+                            fv = a * vx + (1.0 - a) * old_vx
+                            fw = a * vy + (1.0 - a) * old_vy
+                            self.odom_velocity = {
+                                "vx": fv, "vy": fw, "speed": math.hypot(fv, fw), "t": now
+                            }
+            self._speed_prev_position = (now, logical_pos)
         except Exception:
             pass
 
@@ -4593,7 +5116,7 @@ class DFSMapOnlyExplorer:
         print(f" ToF OPEN   : center > {TOF_OPEN_THRESHOLD_MM:.0f} mm (raw approx > {raw_open_equiv:.0f} mm)")
         print(f" ToF origin : +{TOF_FORWARD_FROM_CENTER_M*100.0:.1f} cm from robot centre; safety uses RAW ToF")
         print(f" Muzzle     : +{FIRE_MUZZLE_FORWARD_FROM_CENTER_M*100.0:.1f} cm; +{FIRE_MUZZLE_AHEAD_OF_TOF_M*100.0:.1f} cm ahead of ToF")
-        print(f" Runtime    : RUN pose=(0,0), FRONT=N")
+        print(f" Runtime    : RUN pose={ROOT_CELL}, FRONT=N | field={GRID_WIDTH_CELLS}x{GRID_HEIGHT_CELLS}")
         print(" Features   : DFS + map + ToF node-probe + resilient gimbal + Sharp + IR + runtime-zero yaw PID")
         print(" DFS speed  : explore={:.2f} m/s | known/backtrack={:.2f} m/s".format(DFS_EXPLORE_SPEED_MPS, DFS_KNOWN_SPEED_MPS))
         print(" Targets    : Lab-CLAHE + HSV/LAB + shape/temporal + Foam-board gate + CENTER -> ToF geometry -> selectable fire")
@@ -4690,7 +5213,7 @@ class DFSMapOnlyExplorer:
 
         self.connected = True
         self.mission_start_t = time.monotonic()
-        print(f"[READY] runtime yaw-zero raw={self.base_yaw_deg:+.2f} deg -> logical yaw=0.00 deg; root=(0,0); heading=N")
+        print(f"[READY] runtime yaw-zero raw={self.base_yaw_deg:+.2f} deg -> logical yaw=0.00 deg; root={self.root}; heading=N; field={GRID_WIDTH_CELLS}x{GRID_HEIGHT_CELLS}")
         return True
 
     def cleanup(self):
@@ -5206,8 +5729,13 @@ class DFSMapOnlyExplorer:
         if p is None or y is None:
             return None, None
         if self.gimbal_zero_pitch_raw is None or self.gimbal_zero_yaw_raw is None:
-            return p, y
-        return p - self.gimbal_zero_pitch_raw, y - self.gimbal_zero_yaw_raw
+            # RoboMaster yaw feedback can cross the +/-180 seam.  All target/topology
+            # logic in this program uses signed bearings, so keep yaw canonical.
+            return p, wrap_deg(y)
+        # IMPORTANT: subtracting two raw angles can produce values such as +246.9
+        # even though the physical bearing is -113.1 deg.  The continuous target
+        # sweep compares bearings arithmetically, so always wrap the relative yaw.
+        return p - self.gimbal_zero_pitch_raw, wrap_deg(y - self.gimbal_zero_yaw_raw)
 
     def gimbal_at_target(self, yaw_deg, pitch_deg):
         """Return True when the ToF is pointed at the requested bearing.
@@ -5576,13 +6104,29 @@ class DFSMapOnlyExplorer:
         while destination Sharp remains the collision veto.  This avoids the
         old IR-clear -> immediate Sharp-side-escape double recovery.
         """
-        self.safe_stop()
         l_low, r_low, l_raw, r_raw = self.read_ir_filtered(samples=IR_FILTER_SAMPLES)
 
         if not l_low and not r_low:
             return "CLEAR"
 
+        # Read Sharp before stopping/escaping so sunlight-induced digital IR LOW
+        # cannot by itself force a chassis maneuver.
+        l_pre_cm, r_pre_cm, _l_pre_adc, _r_pre_adc = self.read_sharp_cm()
+
         if l_low and r_low:
+            if (
+                IR_SUNLIGHT_GUARD_ENABLED
+                and (l_pre_cm is None or l_pre_cm > IR_SUNLIGHT_CORROBORATE_MAX_CM)
+                and (r_pre_cm is None or r_pre_cm > IR_SUNLIGHT_CORROBORATE_MAX_CM)
+            ):
+                print(
+                    "[IR SUN GUARD {}] BOTH LOW but Sharp L={} R={}cm -> "
+                    "ambient-light suspect; ignore digital IR".format(
+                        context, l_pre_cm, r_pre_cm
+                    )
+                )
+                return "SUNLIGHT"
+            self.safe_stop()
             print(
                 "[IR SIMPLE {}] BOTH LOW IR=({},{}) -> STOP only; "
                 "no lateral guess, ToF/Sharp own safety".format(
@@ -5595,6 +6139,43 @@ class DFSMapOnlyExplorer:
         source_name = "LEFT" if l_low else "RIGHT"
         dest_name = "RIGHT" if l_low else "LEFT"
         direction_name = "RIGHT" if sign > 0.0 else "LEFT"
+
+        source_pre_cm = l_pre_cm if sign > 0.0 else r_pre_cm
+        if (
+            IR_SUNLIGHT_GUARD_ENABLED
+            and (source_pre_cm is None or source_pre_cm > IR_SUNLIGHT_CORROBORATE_MAX_CM)
+        ):
+            print(
+                "[IR SUN GUARD {}] {} LOW but source Sharp={}cm > {:.1f}cm -> "
+                "ignore IR; Sharp/ToF own safety".format(
+                    context, source_name, source_pre_cm, IR_SUNLIGHT_CORROBORATE_MAX_CM
+                )
+            )
+            return "SUNLIGHT"
+
+        self.safe_stop()
+
+        # IR is only a corner/edge feeler; Sharp owns physical side clearance.
+        # If IR asks us to strafe INTO a side that is already too close, veto the
+        # maneuver before moving.  This is the exact failure seen in the field log:
+        # RIGHT IR kept requesting LEFT while LEFT Sharp was ~5 cm.
+        l0_cm, r0_cm = l_pre_cm, r_pre_cm
+        source0_cm = l0_cm if sign > 0.0 else r0_cm
+        dest0_cm = r0_cm if sign > 0.0 else l0_cm
+        if (
+            dest0_cm is not None
+            and dest0_cm <= IR_DESTINATION_VETO_CM
+            and source0_cm is not None
+            and source0_cm >= IR_SIMPLE_SOURCE_SHARP_CLEAR_CM
+        ):
+            print(
+                "[IR+SHARP {} VETO] {} LOW wants {} but {} Sharp={:.1f}cm "
+                "while source Sharp={:.1f}cm -> Sharp owns; no IR strafe".format(
+                    context, source_name, direction_name, dest_name,
+                    dest0_cm, source0_cm,
+                )
+            )
+            return "VETO"
 
         anchor = self.current_position()
         if anchor is None:
@@ -5715,6 +6296,14 @@ class DFSMapOnlyExplorer:
         elif source_sharp_clear:
             stop_reason = "SOURCE_SHARP_CLEAR"
             result = "CLEAR"
+        elif (
+            last_dest_cm is not None
+            and last_dest_cm <= IR_DESTINATION_VETO_CM
+        ):
+            # Destination-side Sharp veto: do not immediately retry the same IR
+            # request on the next control cycle. The main Sharp escape controller
+            # will move away from the close wall instead.
+            result = "VETO"
         else:
             result = "HOLD"
 
@@ -6084,15 +6673,21 @@ class DFSMapOnlyExplorer:
         }
 
     def move_one_cell(self, source_cell, abs_dir, motion_profile="EXPLORE"):
-        """Public exception boundary for one physical edge traversal."""
+        """Public exception boundary for one physical edge traversal.
+
+        Every confirmed MOVE_ARRIVED is committed to the chronological breadcrumb
+        here, so EXPLORE, shortcut relocation, backtrack and Round-2 shortest travel
+        all share the same trustworthy recorder.
+        """
         abs_dir = int(abs_dir) % 4
         profile = self._motion_profile(motion_profile)
         start_pos = self.current_position(fresh=False)
         target_yaw = self.desired_yaw_for_heading(abs_dir)
         learned_distance = self.remembered_edge_distance(source_cell, abs_dir)
         target_distance = learned_distance if learned_distance is not None else CELL_LENGTH_M
+        result = self.MOVE_POSE_UNCERTAIN
         try:
-            return self._move_one_cell_impl(source_cell, abs_dir, profile)
+            result = self._move_one_cell_impl(source_cell, abs_dir, profile)
         except Exception as exc:
             self.safe_stop()
             detail = f"{type(exc).__name__}: {exc}"
@@ -6101,7 +6696,7 @@ class DFSMapOnlyExplorer:
                 "prove source/destination pose, otherwise retreat",
             )
             try:
-                return self._recover_after_translation_exception(
+                result = self._recover_after_translation_exception(
                     start_pos, target_yaw, target_distance, detail
                 )
             except Exception as recover_exc:
@@ -6111,13 +6706,28 @@ class DFSMapOnlyExplorer:
                     f"{type(recover_exc).__name__}: {recover_exc}",
                     "pose cannot be proven",
                 )
-                return self.MOVE_POSE_UNCERTAIN
+                result = self.MOVE_POSE_UNCERTAIN
+
+        if result == self.MOVE_ARRIVED:
+            try:
+                self._record_breadcrumb(
+                    source_cell, abs_dir, profile, distance_m=self.last_move_distance_m
+                )
+            except Exception as exc:
+                # Breadcrumb is diagnostic/history data: never cancel motion because
+                # the recorder itself had a software/file-shape problem.
+                self.fault(
+                    "BREADCRUMB", f"{type(exc).__name__}: {exc}",
+                    "arrival remains valid; continue mission",
+                )
+        return result
 
     def _move_one_cell_impl(self, source_cell, abs_dir, profile=None):
         if not self.pose_trusted or not self.running:
             return self.MOVE_STOPPED
 
         profile = dict(profile or self._motion_profile("EXPLORE"))
+        self.active_motion_profile_name = str(profile.get("name", "EXPLORE"))
         cruise_speed = float(profile.get("cruise", DFS_EXPLORE_SPEED_MPS))
         approach_min_speed = float(profile.get("approach_min", DFS_EXPLORE_APPROACH_MIN_MPS))
         approach_slow_m = float(profile.get("approach_zone", DFS_EXPLORE_APPROACH_SLOW_M))
@@ -6193,10 +6803,13 @@ class DFSMapOnlyExplorer:
         yaw_bad_since = None
         last_debug = 0.0
         last_y_cmd = 0.0
+        last_x_cmd = 0.0
+        last_cmd_t = start_t
         side_escape_since = None
         side_escape_sign = 0.0
         side_escape_ignore_until = 0.0
         ir_retrigger_ignore_until = 0.0
+        timeout_open_retries = 0
 
         while self.running:
             now = time.monotonic()
@@ -6262,6 +6875,8 @@ class DFSMapOnlyExplorer:
 
             if traveled >= target_distance:
                 self.safe_stop()
+                if SLIPPERY_TILE_MODE:
+                    time.sleep(POST_MOVE_TILE_SETTLE_SEC)
                 # Remove the small yaw residual created by wheel inertia before the
                 # next node scan.  Failure is logged but arrival position remains valid.
                 post_err = self.yaw_error_deg(target_yaw)
@@ -6284,25 +6899,109 @@ class DFSMapOnlyExplorer:
             if now - start_t >= move_timeout_sec:
                 self.safe_stop()
                 if traveled >= target_distance * CELL_SUCCESS_FRACTION:
-                    self.align_heading_stationary(target_yaw, timeout_sec=POST_MOVE_ALIGN_TIMEOUT_SEC, tolerance_deg=PRE_MOVE_ALIGN_TOL_DEG, settle_sec=0.08)
+                    self.align_heading_stationary(
+                        target_yaw,
+                        timeout_sec=POST_MOVE_ALIGN_TIMEOUT_SEC,
+                        tolerance_deg=PRE_MOVE_ALIGN_TOL_DEG,
+                        settle_sec=0.08,
+                    )
                     self.last_move_distance_m = traveled
                     self.fault("MOVE TIMEOUT", f"near node at {traveled:.3f}m", "accept node")
                     return self.MOVE_ARRIVED
+
                 tof_timeout = self.latest_tof(fresh=True)
-                if tof_timeout is not None and traveled >= SENSOR_NO_RETREAT_MIN_NODE_PROGRESS_M:
+                probe = None
+                if tof_timeout is not None:
+                    probe_t0 = time.monotonic()
                     probe = self.stopped_front_topology_probe(traveled, tof_timeout, target_yaw)
-                    if probe.get("valid", 0) >= 2:
-                        self.last_move_distance_m = max(SENSOR_NO_RETREAT_MIN_NODE_PROGRESS_M, traveled)
-                        self.last_stop_probe = dict(probe.get("rays", {}))
-                        self.fault(
-                            "MOVE TIMEOUT HOLD",
-                            "timeout at {:.3f}m".format(traveled),
-                            "accept stationary physical node; no retreat",
-                        )
-                        return self.MOVE_ARRIVED
+                    # Sensor probing is recovery time, not commanded forward travel.
+                    start_t += max(0.0, time.monotonic() - probe_t0)
+
+                # If the front ray is still OPEN and yaw/odometry are healthy, this
+                # was most likely a watchdog timeout caused by IR/Sharp side recovery,
+                # not a lost pose. Give a bounded extra forward window and suppress
+                # the IR request that may have been fighting the Sharp controller.
+                front_state = None
+                if isinstance(probe, dict):
+                    states = probe.get("states", {}) or {}
+                    front_state = states.get("FRONT")
+
+                if (
+                    isinstance(probe, dict)
+                    and probe.get("valid", 0) >= 2
+                    and str(front_state).upper() == "OPEN"
+                    and timeout_open_retries < MOVE_TIMEOUT_OPEN_RETRIES
+                ):
+                    timeout_open_retries += 1
+                    side_escape_sign = 0.0
+                    side_escape_since = None
+                    last_y_cmd = 0.0
+                    self.pid_straight.reset()
+                    cooldown_until = time.monotonic() + IR_DESTINATION_VETO_COOLDOWN_SEC
+                    ir_retrigger_ignore_until = max(ir_retrigger_ignore_until, cooldown_until)
+                    side_escape_ignore_until = max(
+                        side_escape_ignore_until,
+                        time.monotonic() + SHARP_SIDE_ESCAPE_RETRY_COOLDOWN_SEC,
+                    )
+                    self.gimbal_front_down(force=True)
+                    self.align_heading_stationary(
+                        target_yaw,
+                        timeout_sec=0.45,
+                        tolerance_deg=max(0.85, PRE_MOVE_ALIGN_TOL_DEG),
+                        settle_sec=0.04,
+                    )
+                    # Start a fresh bounded watchdog window without changing the
+                    # odometry anchor; traveled still measures from the true source.
+                    move_timeout_sec = max(
+                        float(profile.get("timeout_sec", MAX_CELL_TIME_SEC)),
+                        MOVE_TIMEOUT_OPEN_EXTENSION_SEC,
+                    )
+                    start_t = time.monotonic()
+                    self.fault(
+                        "MOVE TIMEOUT EXTEND",
+                        "front OPEN at {:.3f}m; recovery {}/{}".format(
+                            traveled, timeout_open_retries, MOVE_TIMEOUT_OPEN_RETRIES
+                        ),
+                        "suppress IR/Sharp ping-pong and continue same edge",
+                    )
+                    continue
+
+                # A sensor-confirmed node after meaningful progress may still be
+                # accepted using the existing conservative rule.
+                if (
+                    isinstance(probe, dict)
+                    and traveled >= SENSOR_NO_RETREAT_MIN_NODE_PROGRESS_M
+                    and probe.get("valid", 0) >= 2
+                    and probe.get("node_like")
+                ):
+                    self.last_move_distance_m = max(SENSOR_NO_RETREAT_MIN_NODE_PROGRESS_M, traveled)
+                    self.last_stop_probe = dict(probe.get("rays", {}))
+                    self.fault(
+                        "MOVE TIMEOUT HOLD",
+                        "timeout at {:.3f}m".format(traveled),
+                        "accept sensor-confirmed physical node",
+                    )
+                    return self.MOVE_ARRIVED
+
+                # Last resort: prove the source again instead of immediately killing
+                # the whole mission. A successful closed-loop retreat preserves the
+                # DFS anchor, so the edge can be deferred and other branches explored.
+                if self.retreat_to_source(
+                    start_pos,
+                    "cell timeout at {:.3f}m after bounded OPEN retries".format(traveled),
+                    target_yaw=target_yaw,
+                ):
+                    self.fault(
+                        "MOVE TIMEOUT RETURN",
+                        "returned to source after timeout at {:.3f}m".format(traveled),
+                        "defer edge; continue DFS",
+                    )
+                    return self.MOVE_BLOCKED_RETURNED
+
                 self.fault(
-                    "MOVE TIMEOUT HOLD", "timeout at {:.3f}m".format(traveled),
-                    "STOP in place; automatic reverse disabled",
+                    "MOVE TIMEOUT HOLD",
+                    "timeout at {:.3f}m; source retreat could not be proven".format(traveled),
+                    "STOP in place; pose uncertain",
                 )
                 return self.MOVE_POSE_UNCERTAIN
 
@@ -6408,22 +7107,57 @@ class DFSMapOnlyExplorer:
             # retreat is allowed from an IR event.
             l_low, r_low, l_raw, r_raw = self.read_ir_filtered(samples=1)
             if (l_low ^ r_low) and now >= ir_retrigger_ignore_until:
-                self.safe_stop()
-                ir_t0 = time.monotonic()
-                ir_status = self.ir_simple_side_clear(target_yaw, context="MOVE")
-                start_t += max(0.0, time.monotonic() - ir_t0)
-                self.pid_straight.reset()
-                self.sharp_authority = None
-                if ir_status == "CLEAR":
-                    # Prevent a sticky angled IR from immediately causing a second
-                    # stop a few centimetres later.  Sharp/ToF remain live during
-                    # this short cooldown.
-                    ir_retrigger_ignore_until = time.monotonic() + IR_SIMPLE_RETRIGGER_COOLDOWN_SEC
-                    continue
-                print(
-                    "[IR SIMPLE MOVE] source IR still LOW -> no second policy; "
-                    "resume cautiously under Sharp/ToF"
-                )
+                # Fast sunlight pre-gate BEFORE safe_stop: a lone digital IR LOW
+                # does not interrupt forward motion unless same-side Sharp agrees
+                # that the wall/corner is genuinely close.
+                _sg_lcm, _sg_rcm, _sg_la, _sg_ra = self.read_sharp_cm()
+                _sg_source = _sg_lcm if l_low else _sg_rcm
+                if (
+                    IR_SUNLIGHT_GUARD_ENABLED
+                    and (_sg_source is None or _sg_source > IR_SUNLIGHT_CORROBORATE_MAX_CM)
+                ):
+                    ir_retrigger_ignore_until = (
+                        time.monotonic() + IR_SUNLIGHT_IGNORE_COOLDOWN_SEC
+                    )
+                    print(
+                        "[IR SUN GUARD MOVE] {} LOW raw=({},{}), source Sharp={}cm -> "
+                        "ignore as uncorroborated/ambient IR".format(
+                            "LEFT" if l_low else "RIGHT", l_raw, r_raw, _sg_source
+                        )
+                    )
+                else:
+                    self.safe_stop()
+                    ir_t0 = time.monotonic()
+                    ir_status = self.ir_simple_side_clear(target_yaw, context="MOVE")
+                    start_t += max(0.0, time.monotonic() - ir_t0)
+                    self.pid_straight.reset()
+                    self.sharp_authority = None
+                    if ir_status == "SUNLIGHT":
+                        ir_retrigger_ignore_until = (
+                            time.monotonic() + IR_SUNLIGHT_IGNORE_COOLDOWN_SEC
+                        )
+                    elif ir_status == "CLEAR":
+                        # Prevent a sticky angled IR from immediately causing a second
+                        # stop a few centimetres later.  Sharp/ToF remain live during
+                        # this short cooldown.
+                        ir_retrigger_ignore_until = time.monotonic() + IR_SIMPLE_RETRIGGER_COOLDOWN_SEC
+                        continue
+                    elif ir_status == "VETO":
+                        # The requested IR strafe points into a close opposite wall.
+                        # Ignore this IR direction briefly and let the Sharp controller
+                        # below perform the physically safe escape instead.
+                        ir_retrigger_ignore_until = (
+                            time.monotonic() + IR_DESTINATION_VETO_COOLDOWN_SEC
+                        )
+                        print(
+                            "[IR SIMPLE MOVE] destination Sharp veto -> suppress IR "
+                            "retrigger; Sharp/ToF own recovery"
+                        )
+                    else:
+                        print(
+                            "[IR SIMPLE MOVE] source IR still LOW -> no second policy; "
+                            "resume cautiously under Sharp/ToF"
+                        )
             elif l_low and r_low:
                 print(
                     "[IR SIMPLE MOVE] BOTH LOW IR=({},{}) -> no lateral guess, "
@@ -6491,6 +7225,8 @@ class DFSMapOnlyExplorer:
             else:
                 watched = left_cm if side_escape_sign > 0.0 else right_cm
                 if watched is None or watched >= SHARP_SIDE_ESCAPE_CLEAR_CM:
+                    if side_escape_since is not None:
+                        start_t += max(0.0, now - side_escape_since)
                     side_escape_sign = 0.0
                     side_escape_since = None
                     last_y_cmd = 0.0
@@ -6507,6 +7243,8 @@ class DFSMapOnlyExplorer:
                 )
                 if destination_tight or escape_timeout:
                     self.safe_stop()
+                    if side_escape_since is not None:
+                        start_t += max(0.0, now - side_escape_since)
                     reason = "destination side tight" if destination_tight else "side-wall escape timed out"
                     source_now = left_cm if side_escape_sign > 0.0 else right_cm
 
@@ -6577,6 +7315,15 @@ class DFSMapOnlyExplorer:
                 y_cmd = self.shape_lateral_command(raw_y_cmd, x_cmd, remaining, last_y_cmd)
                 last_y_cmd = y_cmd
 
+            # Smooth-tile traction: avoid instant 0 -> cruise wheel-speed steps.
+            # Deceleration is deliberately NOT rate-limited so obstacle/safety
+            # braking can still reduce speed immediately.
+            if SLIPPERY_TILE_MODE and x_cmd > last_x_cmd:
+                dt_cmd = max(0.005, min(0.20, now - last_cmd_t))
+                x_cmd = min(x_cmd, last_x_cmd + MOVE_FORWARD_ACCEL_LIMIT_MPS2 * dt_cmd)
+            last_x_cmd = float(x_cmd)
+            last_cmd_t = now
+
             z_cmd = (
                 self.lateral_yaw_hold_command(target_yaw)
                 if side_escape_sign != 0.0
@@ -6616,19 +7363,42 @@ class DFSMapOnlyExplorer:
     # CELL SCAN
     # --------------------------------------------------------
     def set_edge_state(self, cell, direction, state):
-        """Store one sensed edge state.
+        """Store one sensed edge state while enforcing configured arena bounds.
 
-        A mere ToF observation is not allowed to overwrite a contradictory
-        reciprocal WALL/OPEN already measured from the other cell.  Physical
-        traversal uses mark_traversed_open(), which is stronger evidence and
-        forces both directions OPEN.
+        An OPEN ToF ray is only a geometric observation.  If that ray points from
+        a legal cell to an out-of-field logical coordinate, it is semantically an
+        OUTSIDE aperture and is stored as BLOCKED before DFS can translate.
         """
         direction = int(direction) % 4
         cell = tuple(cell)
         state = str(state)
-        self.edge_state[(cell, direction)] = state
         nb = neighbor(cell, direction)
+
+        if (
+            FIELD_BOUNDARY_GUARD_ENABLED
+            and cell_in_field(cell)
+            and not cell_in_field(nb)
+            and state == "OPEN"
+        ):
+            state = "BLOCKED"
+            key = (cell, direction)
+            first = key not in self.boundary_rejected_edges
+            self.boundary_rejected_edges.add(key)
+            self.fake_exit_rejected_edges.add(key)  # retained for old GUI/snapshot compatibility
+            if first:
+                print(
+                    "[FIELD BOUNDARY] {} -> {} dir={} sensor=OPEN but destination is "
+                    "outside {}x{} -> BLOCKED (no translation)".format(
+                        cell, nb, DIR_NAMES[direction], GRID_WIDTH_CELLS, GRID_HEIGHT_CELLS
+                    )
+                )
+
+        self.edge_state[(cell, direction)] = state
         opposite = (direction + 2) % 4
+
+        # Never create reciprocal pseudo-cells outside the legal map.
+        if not cell_in_field(nb):
+            return state
 
         existing = self.edge_state.get((nb, opposite))
         if state == "OPEN":
@@ -6637,14 +7407,19 @@ class DFSMapOnlyExplorer:
         elif state in ("WALL", "BLOCKED"):
             if existing != "OPEN":
                 self.edge_state[(nb, opposite)] = state
+        return state
 
     def mark_traversed_open(self, cell, direction):
-        """Physical traversal is definitive evidence that an edge is OPEN."""
+        """Physical traversal is definitive OPEN evidence, but never outside configured arena bounds."""
         direction = int(direction) % 4
         cell = tuple(cell)
         nb = neighbor(cell, direction)
+        if FIELD_BOUNDARY_GUARD_ENABLED and not cell_in_field(nb):
+            self.set_edge_state(cell, direction, "BLOCKED")
+            return False
         self.edge_state[(cell, direction)] = "OPEN"
         self.edge_state[(nb, (direction + 2) % 4)] = "OPEN"
+        return True
 
     def root_back_scan(self):
         if not ROOT_BACK_SCAN_ENABLED or self.base_yaw_deg is None:
@@ -6716,12 +7491,10 @@ class DFSMapOnlyExplorer:
                 state = "UNKNOWN"
             else:
                 valid += 1
-                if tof_is_open_from_center(mm):
-                    state = "OPEN"
-                    ordered_open.append(abs_dir)
-                else:
-                    state = "WALL"
-            self.set_edge_state(cell, abs_dir, state)
+                state = "OPEN" if tof_is_open_from_center(mm) else "WALL"
+            state = self.set_edge_state(cell, abs_dir, state)
+            if state == "OPEN":
+                ordered_open.append(abs_dir)
             center_mm = tof_topology_center_mm(mm)
             print(f"  [NODE MAP] {label:<5} ToF(raw)={mm} center={center_mm} -> {state} ({DIR_NAMES[abs_dir]})")
 
@@ -6784,6 +7557,102 @@ class DFSMapOnlyExplorer:
         )
         return ordered_open
 
+    def _confirm_fake_exit_candidate(self, cell, scan, ordered_open):
+        """Strictly verify a newly-entered wide-open apron / fake exit.
+
+        A normal 60-cm four-way intersection usually has nearby diagonal corner
+        geometry, while an opening that leads outside the maze stays long on both
+        +/-45-degree rays.  We only flag the cell; the DFS loop performs the
+        physical retreat so scan_cell itself never translates the chassis.
+        """
+        if not FAKE_EXIT_GUARD_ENABLED or tuple(cell) == tuple(self.root):
+            return False
+        p = self.parent.get(tuple(cell))
+        if p is None:
+            return False
+
+        # BACK is already a proven traversed OPEN edge.  Require all four
+        # cardinal directions open before spending time on the two diagonal rays.
+        back_dir = direction_between(tuple(cell), tuple(p))
+        if back_dir is None:
+            return False
+        cardinal_open = all(
+            self.edge_state.get((tuple(cell), d)) == "OPEN" for d in range(4)
+        )
+        if FAKE_EXIT_REQUIRE_ALL_CARDINAL_OPEN and not cardinal_open:
+            return False
+
+        diag_rows = []
+        diag_ok = True
+        print(f"[EXIT GUARD] cell={cell} four-way OPEN -> verify diagonals +/-45deg")
+        for yaw in FAKE_EXIT_DIAG_YAWS_DEG:
+            mm = self.scan_tof_at_yaw(yaw)
+            center_mm = tof_topology_center_mm(mm)
+            diag_rows.append((float(yaw), mm, center_mm))
+            good = bool(center_mm is not None and center_mm >= FAKE_EXIT_DIAG_MIN_CENTER_MM)
+            diag_ok = diag_ok and good
+            print(
+                "  [EXIT DIAG] yaw={:+.0f} raw={} center={} -> {}".format(
+                    yaw, mm, center_mm, "WIDE" if good else "MAZE_GEOMETRY"
+                )
+            )
+
+        scan["EXIT_DIAGONALS"] = [
+            {"yaw_deg": y, "raw_mm": mm, "center_mm": cm} for y, mm, cm in diag_rows
+        ]
+        self.gimbal_front_down(force=True)
+        if not diag_ok:
+            print(f"[EXIT GUARD] cell={cell} rejected: diagonals do not look like outside apron")
+            return False
+
+        self.fake_exit_candidates.add(tuple(cell))
+        print(
+            f"[FAKE EXIT CANDIDATE] cell={cell} parent={p} -> DO NOT finish mission; "
+            "DFS will retreat and block this edge"
+        )
+        return True
+
+    def _reject_fake_exit_and_return(self, cell):
+        """Return from a verified wide-open fake exit and blacklist its edge."""
+        cell = tuple(cell)
+        parent = self.parent.get(cell)
+        if parent is None:
+            return False
+        parent = tuple(parent)
+        back_dir = direction_between(cell, parent)
+        out_dir = direction_between(parent, cell)
+        if back_dir is None or out_dir is None:
+            return False
+
+        print(f"[FAKE EXIT RETURN] {cell} -> {parent} dir={DIR_NAMES[back_dir]}")
+        if not self.turn_to_direction(back_dir):
+            self.enter_safe_pause(f"fake-exit retreat turn failed at {cell}")
+            return False
+        result = self.move_one_cell(cell, back_dir, motion_profile="BACKTRACK_FAST")
+        if result != self.MOVE_ARRIVED:
+            self.enter_safe_pause(f"fake-exit retreat could not prove return {cell}->{parent}")
+            return False
+
+        self.current = parent
+        # Semantic block: the aperture is physically traversable but intentionally
+        # excluded from maze exploration / Round-2 shortest routing.
+        self.edge_state[(parent, out_dir)] = "BLOCKED"
+        self.edge_state[(cell, back_dir)] = "BLOCKED"
+        self.fake_exit_rejected_edges.add((parent, out_dir))
+        self.open_dirs[parent] = [d for d in self.open_dirs.get(parent, []) if d != out_dir]
+        # Resolve all outside-cell bearings so they cannot keep map_complete false.
+        for d in range(4):
+            self.edge_state[(cell, d)] = "BLOCKED"
+        self.open_dirs[cell] = []
+        self.fake_exit_candidates.discard(cell)
+        print(
+            f"[FAKE EXIT BLOCKED] edge {parent}->{cell} ({DIR_NAMES[out_dir]}) excluded; "
+            "continue exploring remaining maze"
+        )
+        if MAP_AUTOSAVE:
+            self.save_map(final=False)
+        return True
+
     def _scan_cell_impl(self, cell):
         print(f"\n[SCAN] cell={cell} heading={DIR_NAMES[self.heading]}")
         ordered_open = []
@@ -6804,10 +7673,11 @@ class DFSMapOnlyExplorer:
                 state = "UNKNOWN"
             elif tof_is_open_from_center(mm):
                 state = "OPEN"
-                ordered_open.append(abs_dir)
             else:
                 state = "WALL"
-            self.set_edge_state(cell, abs_dir, state)
+            state = self.set_edge_state(cell, abs_dir, state)
+            if state == "OPEN":
+                ordered_open.append(abs_dir)
             center_mm = tof_topology_center_mm(mm)
             print(f"  {label:<5} yaw={yaw_deg:+5.0f} ToF(raw)={mm} center={center_mm} -> {state} ({DIR_NAMES[abs_dir]})")
 
@@ -6831,7 +7701,7 @@ class DFSMapOnlyExplorer:
                 scan[label] = mm
                 abs_dir = (self.heading + rel) % 4
                 state = "OPEN" if tof_is_open_from_center(mm) else "WALL"
-                self.set_edge_state(cell, abs_dir, state)
+                state = self.set_edge_state(cell, abs_dir, state)
                 if state == "OPEN" and abs_dir not in ordered_open:
                     ordered_open.append(abs_dir)
                 print(
@@ -6851,13 +7721,13 @@ class DFSMapOnlyExplorer:
             scan["BACK"] = mm
             back_dir = (self.heading + REL_BACK) % 4
             if mm is None:
-                self.set_edge_state(cell, back_dir, "UNKNOWN")
+                state = self.set_edge_state(cell, back_dir, "UNKNOWN")
             elif tof_is_open_from_center(mm):
-                self.mark_traversed_open(cell, back_dir)
-                if back_dir not in ordered_open:
+                state = self.set_edge_state(cell, back_dir, "OPEN")
+                if state == "OPEN" and back_dir not in ordered_open:
                     ordered_open.append(back_dir)
             else:
-                self.set_edge_state(cell, back_dir, "WALL")
+                state = self.set_edge_state(cell, back_dir, "WALL")
             print(f"  BACK  chassis-180 ToF={mm} -> {self.edge_state.get((tuple(cell), back_dir))} ({DIR_NAMES[back_dir]})")
 
         self.cell_scan_mm[tuple(cell)] = scan
@@ -6867,18 +7737,30 @@ class DFSMapOnlyExplorer:
         self.open_dirs[tuple(cell)] = ordered_open
         print("  OPEN:", [DIR_NAMES[d] for d in ordered_open])
 
-        # TARGET SERVICE ISOLATION:
-        # mapping/topology has already been committed for this stationary node.
-        # Any camera, detector, aim or fire failure is contained and cannot make
-        # DFS forget the node or move the chassis off its anchor.
+        # Legacy geometry-based fake-exit guard is disabled when configured bounds are authoritative.
+        # The authoritative boundary guard rejects any out-of-field opening before movement.
         try:
-            self.target_system.scan_cell(cell)
+            self._confirm_fake_exit_candidate(cell, scan, ordered_open)
         except Exception as exc:
             self.fault(
-                "TARGET SCAN",
-                f"cell={cell}: {type(exc).__name__}: {exc}",
-                "skip targets at this node / continue DFS",
+                "EXIT GUARD", f"cell={cell}: {type(exc).__name__}: {exc}",
+                "ignore exit classification and continue normal DFS",
             )
+
+        # TARGET SERVICE ISOLATION:
+        # Do not waste competition time searching/shooting in a verified outside
+        # apron.  The DFS loop will retreat from this cell immediately.
+        if tuple(cell) not in self.fake_exit_candidates:
+            try:
+                self.target_system.scan_cell(cell)
+            except Exception as exc:
+                self.fault(
+                    "TARGET SCAN",
+                    f"cell={cell}: {type(exc).__name__}: {exc}",
+                    "skip targets at this node / continue DFS",
+                )
+        else:
+            print(f"[FAKE EXIT] skip target service at outside candidate cell={cell}")
 
         self.gimbal_front_down(force=True)
         return ordered_open
@@ -6911,7 +7793,7 @@ class DFSMapOnlyExplorer:
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "complete": bool(final and self.map_complete),
             "safe_pause_reason": self.safe_pause_reason,
-            "root": [0, 0],
+            "root": [int(self.root[0]), int(self.root[1])],
             "current": [self.current[0], self.current[1]],
             "heading": DIR_NAMES[self.heading],
             "grid_tile_m": GRID_TILE_M,
@@ -6923,6 +7805,23 @@ class DFSMapOnlyExplorer:
                 0.0, TOF_OPEN_THRESHOLD_MM - TOF_FORWARD_FROM_CENTER_M*1000.0
             ),
             "visited": [[x, y] for x, y in sorted(self.visited)],
+            "fake_exit_rejected_edges": [
+                {"cell": [c[0], c[1]], "dir": DIR_NAMES[d], "dir_index": int(d)}
+                for c, d in sorted(self.fake_exit_rejected_edges, key=lambda row: (row[0][1], row[0][0], row[1]))
+            ],
+            "field_bounds": {
+                "profile_name": ARENA_PROFILE_NAME,
+                "width_cells": GRID_WIDTH_CELLS,
+                "height_cells": GRID_HEIGHT_CELLS,
+                "x_min": GRID_X_MIN, "x_max": GRID_X_MAX,
+                "y_min": GRID_Y_MIN, "y_max": GRID_Y_MAX,
+                "boundary_guard": bool(FIELD_BOUNDARY_GUARD_ENABLED),
+            },
+            "boundary_rejected_edges": [
+                {"cell": [c[0], c[1]], "dir": DIR_NAMES[d], "dir_index": int(d),
+                 "outside_cell": list(neighbor(c, d))}
+                for c, d in sorted(self.boundary_rejected_edges, key=lambda row: (row[0][1], row[0][0], row[1]))
+            ],
             "parent": {
                 f"{c[0]},{c[1]}": (None if p is None else [p[0], p[1]])
                 for c, p in self.parent.items()
@@ -6946,6 +7845,8 @@ class DFSMapOnlyExplorer:
                     key=lambda item: (item[0][0][1], item[0][0][0], item[0][1]),
                 )
             ],
+            "breadcrumb_count": len(self.breadcrumb_snapshot()),
+            "breadcrumb_trail": self.breadcrumb_snapshot(),
             "deferred_edges": [
                 {"cell": [c[0], c[1]], "dir": DIR_NAMES[d]}
                 for c, d in sorted(self.deferred_edges)
@@ -7023,6 +7924,7 @@ class DFSMapOnlyExplorer:
 
         lines = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            '<defs><marker id="crumbArrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#d27b00"/></marker></defs>',
             '<rect width="100%" height="100%" fill="white"/>',
             '<g stroke-linecap="round" font-family="monospace">',
         ]
@@ -7056,6 +7958,20 @@ class DFSMapOnlyExplorer:
             label = "S" if cell == self.root else f"{cell[0]},{cell[1]}"
             lines.append(f'<text x="{sx+cell_px/2}" y="{sy+cell_px/2+5}" text-anchor="middle" font-size="12">{label}</text>')
 
+        # Saved SVG also carries the physical breadcrumb history (orange arrows).
+        for b in self.breadcrumb_snapshot()[-160:]:
+            if not isinstance(b, dict):
+                continue
+            fr = b.get("from"); to = b.get("to")
+            if not (isinstance(fr, (list, tuple)) and len(fr) >= 2 and isinstance(to, (list, tuple)) and len(to) >= 2):
+                continue
+            fr = (int(fr[0]), int(fr[1])); to = (int(to[0]), int(to[1]))
+            fx, fy = xy(fr); tx, ty = xy(to)
+            lines.append(
+                f'<line x1="{fx+cell_px/2}" y1="{fy+cell_px/2}" x2="{tx+cell_px/2}" y2="{ty+cell_px/2}" '
+                'stroke="#d27b00" stroke-width="2" marker-end="url(#crumbArrow)" opacity="0.75"/>'
+            )
+
         sx, sy = xy(self.current)
         cx, cy = sx + cell_px/2, sy + cell_px/2
         arrow = {0: (0, -18), 1: (18, 0), 2: (0, 18), 3: (-18, 0)}[self.heading]
@@ -7069,6 +7985,9 @@ class DFSMapOnlyExplorer:
             MAP_DIR.mkdir(parents=True, exist_ok=True)
             payload = self.build_map_payload(final=final)
             atomic_write_text(MAP_LATEST_JSON, json.dumps(payload, ensure_ascii=False, indent=2))
+            # Keep a tiny standalone chronological trail too.  Round 2 does NOT
+            # require this file because the same trail is embedded in its bundle.
+            self.save_breadcrumb()
             # V20: during the live run JSON is the crash-safe checkpoint.  ASCII/SVG
             # rendering is deferred until final save so DFS does not repeatedly spend
             # competition time regenerating presentation files after every move.
@@ -7126,13 +8045,16 @@ class DFSMapOnlyExplorer:
                 "version": 1,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "map_complete": bool(self.map_complete),
-                "start_pose_rule": {"cell": [0, 0], "heading": "N"},
+                "start_pose_rule": {"cell": [int(self.root[0]), int(self.root[1])], "heading": "N"},
                 "map": self.build_map_payload(final=self.map_complete),
                 "selected_target_classes": [
                     {"color": c, "shape": sh} for c, sh in self.get_target_selection()
                 ],
                 "fire_hint_count": len(hints),
                 "fire_hints": hints,
+                "breadcrumb_count": len(self.breadcrumb_snapshot()),
+                # Full trail also lives inside map.breadcrumb_trail; count here
+                # makes snapshot inspection obvious without parsing the map first.
             }
             atomic_write_text(
                 ROUND1_ATTACK_MEMORY_JSON,
@@ -7151,15 +8073,87 @@ class DFSMapOnlyExplorer:
             )
             return False
 
-    def load_round1_attack_memory(self):
+    def save_manual_stop_checkpoint(self, reason="manual_stop"):
+        """STOP NOW + persist everything Round 2 needs.
+
+        This is intentionally callable directly from the GUI before the mission
+        worker reaches cleanup().  Cleanup still saves again as a second layer.
+        Round 1 writes: latest_map.json + latest_targets.json + the self-contained
+        round1_attack_memory.json bundle used by Round 2.
+        """
+        self.running = False
         try:
-            payload = json.loads(ROUND1_ATTACK_MEMORY_JSON.read_text(encoding="utf-8"))
+            self.safe_stop()
+        except Exception as exc:
+            self.fault("STOP CHECKPOINT", f"safe_stop: {type(exc).__name__}: {exc}", "continue saving")
+
+        map_ok = False
+        try:
+            map_ok = bool(self.save_map(final=bool(self.map_complete)))
+        except Exception as exc:
+            self.fault("STOP CHECKPOINT", f"map: {type(exc).__name__}: {exc}", "continue saving")
+
+        target_ok = True
+        try:
+            self.target_system.save_targets()
+        except Exception as exc:
+            target_ok = False
+            self.fault("STOP CHECKPOINT", f"targets: {type(exc).__name__}: {exc}", "continue saving")
+
+        memory_ok = True
+        if self.mission_mode == "ROUND1":
+            try:
+                memory_ok = bool(self.save_round1_attack_memory())
+            except Exception as exc:
+                memory_ok = False
+                self.fault("STOP CHECKPOINT", f"round1 memory: {type(exc).__name__}: {exc}", "cleanup will retry")
+
+        print(
+            "[STOP CHECKPOINT] reason={} map={} targets={} round1_bundle={} bundle_path={}".format(
+                reason, map_ok, target_ok, memory_ok if self.mission_mode == "ROUND1" else "N/A",
+                ROUND1_ATTACK_MEMORY_JSON,
+            )
+        )
+        return bool(map_ok and target_ok and memory_ok)
+
+    def load_round1_attack_memory(self, path=None):
+        """Load one self-contained Round-1 competition snapshot.
+
+        The file contains BOTH the learned map and proven firing anchors, so
+        Round 2 never needs latest_map.json/latest_targets.json separately.
+        Passing a path from the GUI also makes that path the active Round-2
+        source used again when START MISSION is pressed.
+        """
+        memory_path = Path(path) if path is not None else Path(self.round1_memory_path)
+        self.round1_memory_path = memory_path
+        try:
+            payload = json.loads(memory_path.read_text(encoding="utf-8"))
             if payload.get("schema") != "robomaster_round1_attack_memory":
                 raise ValueError("wrong round1 memory schema")
             mp = payload.get("map") or {}
-            visited = {tuple(int(v) for v in c[:2]) for c in mp.get("visited", []) if len(c) >= 2}
+
+            # Rehydrate the generic arena frame saved by Round 1 before parsing
+            # cells.  This makes Round 2 portable across arbitrary WxH profiles.
+            saved_bounds = mp.get("field_bounds") or {}
+            saved_root = mp.get("root", payload.get("start_pose_rule", {}).get("cell", list(ROOT_CELL)))
+            if isinstance(saved_bounds, dict) and saved_bounds.get("width_cells") and saved_bounds.get("height_cells"):
+                apply_arena_profile({
+                    "name": "round1_snapshot",
+                    "width_cells": saved_bounds.get("width_cells"),
+                    "height_cells": saved_bounds.get("height_cells"),
+                    "x_min": saved_bounds.get("x_min", GRID_X_MIN),
+                    "y_min": saved_bounds.get("y_min", GRID_Y_MIN),
+                    "start_cell": saved_root,
+                    "boundary_guard": bool(saved_bounds.get("boundary_guard", True)),
+                }, source="round1 snapshot")
+
+            visited = {
+                tuple(int(v) for v in c[:2])
+                for c in mp.get("visited", [])
+                if len(c) >= 2 and cell_in_field(tuple(int(v) for v in c[:2]))
+            }
             if not visited:
-                raise ValueError("round1 memory has no visited cells")
+                raise ValueError("round1 memory has no in-field visited cells")
 
             edges = {}
             for row in mp.get("edges", []):
@@ -7171,7 +8165,14 @@ class DFSMapOnlyExplorer:
                     d = DIR_NAMES.index(row.get("dir"))
                 if d is None:
                     continue
-                edges[((int(cell[0]), int(cell[1])), int(d) % 4)] = str(row.get("state") or "UNKNOWN")
+                c = (int(cell[0]), int(cell[1]))
+                if not cell_in_field(c):
+                    continue
+                dd = int(d) % 4
+                state = str(row.get("state") or "UNKNOWN")
+                if state == "OPEN" and not cell_in_field(neighbor(c, dd)):
+                    state = "BLOCKED"
+                edges[(c, dd)] = state
 
             open_dirs = {}
             for key, dirs in (mp.get("open_dirs") or {}).items():
@@ -7184,7 +8185,8 @@ class DFSMapOnlyExplorer:
                 for d in dirs or []:
                     if d in DIR_NAMES:
                         out.append(DIR_NAMES.index(d))
-                open_dirs[cell] = out
+                if cell_in_field(cell):
+                    open_dirs[cell] = [d for d in out if cell_in_field(neighbor(cell, d))]
 
             edge_travel = {}
             for row in mp.get("edge_travel_m", []):
@@ -7193,7 +8195,10 @@ class DFSMapOnlyExplorer:
                 if not isinstance(cell, (list, tuple)) or len(cell) < 2 or dname not in DIR_NAMES:
                     continue
                 try:
-                    edge_travel[((int(cell[0]), int(cell[1])), DIR_NAMES.index(dname))] = float(row.get("distance_m"))
+                    c = (int(cell[0]), int(cell[1]))
+                    d = DIR_NAMES.index(dname)
+                    if cell_in_field(c) and cell_in_field(neighbor(c, d)):
+                        edge_travel[(c, d)] = float(row.get("distance_m"))
                 except Exception:
                     pass
 
@@ -7201,6 +8206,34 @@ class DFSMapOnlyExplorer:
             self.edge_state = edges
             self.open_dirs = open_dirs
             self.edge_travel_m = edge_travel
+            loaded_trail = []
+            for row in mp.get("breadcrumb_trail", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                fr = row.get("from"); to = row.get("to")
+                if not (isinstance(fr, (list, tuple)) and len(fr) >= 2 and isinstance(to, (list, tuple)) and len(to) >= 2):
+                    continue
+                loaded_trail.append(dict(row))
+            with self.breadcrumb_lock:
+                self.breadcrumb_trail = loaded_trail
+                self.breadcrumb_seq = max(
+                    [int(r.get("seq", 0) or 0) for r in loaded_trail] or [0]
+                )
+            self.boundary_rejected_edges = set()
+            for row in mp.get("boundary_rejected_edges", []) or []:
+                try:
+                    c = tuple(int(v) for v in row.get("cell", [])[:2])
+                    raw_d = row.get("dir_index")
+                    if raw_d is None and row.get("dir") in DIR_NAMES:
+                        raw_d = DIR_NAMES.index(row.get("dir"))
+                    if raw_d is None:
+                        continue
+                    d = int(raw_d) % 4
+                    if len(c) == 2 and cell_in_field(c):
+                        self.boundary_rejected_edges.add((c, d))
+                except Exception:
+                    pass
+
             self.cell_scan_mm = {}
             for key, value in (mp.get("cell_scan_mm") or {}).items():
                 try:
@@ -7208,21 +8241,27 @@ class DFSMapOnlyExplorer:
                     self.cell_scan_mm[(int(xs), int(ys))] = value
                 except Exception:
                     pass
-            self.root = (0, 0)
+            try:
+                candidate_root = (int(saved_root[0]), int(saved_root[1]))
+            except Exception:
+                candidate_root = tuple(ROOT_CELL)
+            self.root = candidate_root if cell_in_field(candidate_root) else tuple(ROOT_CELL)
             self.current = self.root
             self.heading = 0
             self.map_complete = bool(payload.get("map_complete", mp.get("complete", False)))
             self.round1_memory = payload
             self.round2_hints = [dict(h) for h in payload.get("fire_hints", []) if isinstance(h, dict)]
+            self.round2_preview_plan = {}
             print(
-                "[ROUND2 LOAD] cells={} hints={} map_complete={} <- {}".format(
-                    len(self.visited), len(self.round2_hints), self.map_complete, ROUND1_ATTACK_MEMORY_JSON
+                "[ROUND2 LOAD] cells={} hints={} breadcrumbs={} map_complete={} <- {}".format(
+                    len(self.visited), len(self.round2_hints), len(self.breadcrumb_snapshot()),
+                    self.map_complete, memory_path
                 )
             )
             return True
         except FileNotFoundError:
             self.fault(
-                "ROUND2 LOAD", f"missing {ROUND1_ATTACK_MEMORY_JSON}",
+                "ROUND2 LOAD", f"missing {memory_path}",
                 "run ROUND1 first",
             )
         except Exception as exc:
@@ -7344,6 +8383,101 @@ class DFSMapOnlyExplorer:
         print("[ROUND2 PLAN] nearest-neighbour anchor order={}".format(order))
         return order
 
+    def _route_physical_distance_m(self, route):
+        """Estimate known-route travel using learned edge distances when available."""
+        if not route or len(route) < 2:
+            return 0.0
+        total = 0.0
+        for a, b in zip(route, route[1:]):
+            d = direction_between(tuple(a), tuple(b))
+            if d is None:
+                continue
+            dist = self.edge_travel_m.get((tuple(a), d))
+            if dist is None:
+                dist = self.edge_travel_m.get((tuple(b), (d + 2) % 4))
+            try:
+                total += float(dist) if dist is not None else float(CELL_LENGTH_M)
+            except Exception:
+                total += float(CELL_LENGTH_M)
+        return total
+
+    def build_round2_preview_plan(self):
+        """Build the exact route that Round 2 intends to use, without moving.
+
+        Target anchors are the proven firing cells saved by Round 1.  Anchor
+        order is globally shortest on the known OPEN-edge graph for <=11 unique
+        anchors (Held-Karp), with the existing deterministic fallback above that.
+        """
+        selected = [h for h in self.round2_hints if self._round2_hint_selected(h)]
+        hints_by_cell = {}
+        rejected = []
+        for h in selected:
+            cell = h.get("cell")
+            if not isinstance(cell, (list, tuple)) or len(cell) < 2:
+                rejected.append(dict(h, preview_failure="invalid_cell"))
+                continue
+            c = (int(cell[0]), int(cell[1]))
+            if c not in self.visited:
+                rejected.append(dict(h, preview_failure="cell_not_in_map"))
+                continue
+            hints_by_cell.setdefault(c, []).append(h)
+
+        start = tuple(self.current)
+        order = self._round2_anchor_order(start, list(hints_by_cell.keys()))
+        if start in hints_by_cell:
+            order = [start] + order
+
+        route_cells = [start]
+        segments = []
+        cursor = start
+        reachable_anchors = []
+        for anchor_cell in order:
+            anchor_cell = tuple(anchor_cell)
+            if cursor == anchor_cell:
+                route = [cursor]
+            else:
+                route = self.find_visited_route(cursor, anchor_cell)
+            if not route:
+                for h in hints_by_cell.get(anchor_cell, []):
+                    rejected.append(dict(h, preview_failure="route_unavailable"))
+                continue
+            route = [tuple(c) for c in route]
+            if len(route) > 1:
+                route_cells.extend(route[1:])
+            reachable_anchors.append(anchor_cell)
+            segments.append({
+                "from": tuple(cursor),
+                "to": anchor_cell,
+                "route": route,
+                "steps": max(0, len(route) - 1),
+                "distance_m": self._route_physical_distance_m(route),
+                "hint_count": len(hints_by_cell.get(anchor_cell, [])),
+            })
+            cursor = anchor_cell
+
+        plan = {
+            "source_path": str(self.round1_memory_path),
+            "start": start,
+            "selected_hint_count": len(selected),
+            "anchor_count": len(reachable_anchors),
+            "anchor_order": reachable_anchors,
+            "route_cells": route_cells,
+            "segments": segments,
+            "total_steps": sum(int(seg["steps"]) for seg in segments),
+            "total_distance_m": sum(float(seg["distance_m"]) for seg in segments),
+            "rejected": rejected,
+            # Internal execution cache.  Kept in memory only; never serialized.
+            "hints_by_cell": hints_by_cell,
+        }
+        self.round2_preview_plan = plan
+        print(
+            "[ROUND2 PREVIEW] anchors={} hints={} steps={} distance~{:.2f}m route={}".format(
+                plan["anchor_count"], plan["selected_hint_count"],
+                plan["total_steps"], plan["total_distance_m"], plan["route_cells"]
+            )
+        )
+        return plan
+
     def _save_round2_result(self, started_at, attempts, successes, failed_hints, reason):
         try:
             payload = {
@@ -7368,11 +8502,12 @@ class DFSMapOnlyExplorer:
     def run_round2_attack(self):
         started_iso = datetime.now().isoformat(timespec="seconds")
         t0 = time.monotonic()
-        if not self.load_round1_attack_memory():
+        if not self.load_round1_attack_memory(self.round1_memory_path):
             self.safe_stop()
             self._save_round2_result(started_iso, 0, 0, [], "round1 memory unavailable")
             return False
 
+        plan = self.build_round2_preview_plan()
         selected = [h for h in self.round2_hints if self._round2_hint_selected(h)]
         if not selected:
             print("[ROUND2] no proven Round-1 fired hints match the current 16-target selection")
@@ -7380,23 +8515,10 @@ class DFSMapOnlyExplorer:
             self._save_round2_result(started_iso, 0, 0, [], "no selected fired hints")
             return True
 
-        # Group hints by proven logical firing cell.  One route visit can service
-        # several targets at the same node without redundant driving.
-        hints_by_cell = {}
-        for h in selected:
-            cell = h.get("cell")
-            if not isinstance(cell, (list, tuple)) or len(cell) < 2:
-                continue
-            c = (int(cell[0]), int(cell[1]))
-            if c not in self.visited:
-                self.fault("ROUND2 HINT", f"hint cell {c} absent from map", "skip hint")
-                continue
-            hints_by_cell.setdefault(c, []).append(h)
-
-        order = self._round2_anchor_order(self.current, list(hints_by_cell.keys()))
-        # The root may itself contain targets; service it first without driving.
-        if self.current in hints_by_cell:
-            order = [self.current] + order
+        # Use exactly the same grouped hints + globally-shortest anchor order that
+        # the GUI preview displayed before START.
+        hints_by_cell = dict(plan.get("hints_by_cell") or {})
+        order = [tuple(c) for c in (plan.get("anchor_order") or [])]
 
         attempts = 0
         successes = 0
@@ -7535,6 +8657,22 @@ class DFSMapOnlyExplorer:
         if self.edge_is_deferred(cell, direction):
             return False
 
+        # Authoritative configured-boundary check.  This catches any perimeter
+        # opening generically, without knowing an exit coordinate in advance and
+        # before the chassis moves even one centimetre.
+        if FIELD_BOUNDARY_GUARD_ENABLED and not cell_in_field(next_cell):
+            self.set_edge_state(cell, direction, "BLOCKED")
+            if direction in self.open_dirs.get(tuple(cell), []):
+                self.open_dirs[tuple(cell)] = [d for d in self.open_dirs[tuple(cell)] if d != direction]
+            self.fault(
+                "FIELD BOUNDARY",
+                f"reject {tuple(cell)}->{tuple(next_cell)} dir={DIR_NAMES[int(direction)%4]}",
+                "outside configured arena; continue DFS inside field",
+            )
+            if MAP_AUTOSAVE:
+                self.save_map(final=False)
+            return False
+
         if not self.turn_to_direction(direction):
             n = self.turn_failures.get(key, 0) + 1
             self.turn_failures[key] = n
@@ -7634,6 +8772,57 @@ class DFSMapOnlyExplorer:
                 self.remember_edge_distance(src, d, self.last_move_distance_m)
         return True
 
+    def find_fastest_known_route(self, start, goal):
+        """Dijkstra over confirmed visited OPEN edges, including turn cost."""
+        import heapq
+        start = tuple(start); goal = tuple(goal)
+        if start == goal:
+            return [start]
+        start_h = int(self.heading) % 4
+        pq = [(0.0, start, start_h)]
+        best = {(start, start_h): 0.0}
+        prev = {}
+        goal_state = None
+        while pq:
+            cost, cell, h = heapq.heappop(pq)
+            state = (cell, h)
+            if cost > best.get(state, float("inf")) + 1e-9:
+                continue
+            if cell == goal:
+                goal_state = state
+                break
+            for d in range(4):
+                if self.edge_state.get((cell, d)) != "OPEN":
+                    continue
+                nb = neighbor(cell, d)
+                if nb not in self.visited:
+                    continue
+                edge_m = self.remembered_edge_distance(cell, d)
+                if edge_m is None:
+                    edge_m = CELL_LENGTH_M
+                q = abs((d - h) % 4); q = min(q, 4-q)
+                step = float(edge_m) / max(0.10, DFS_KNOWN_SPEED_MPS) + 0.55*float(q)
+                ns = (nb, d)
+                nc = cost + step
+                if nc + 1e-9 < best.get(ns, float("inf")):
+                    best[ns] = nc
+                    prev[ns] = state
+                    heapq.heappush(pq, (nc, nb, d))
+        if goal_state is None:
+            return None
+        states=[]; cur=goal_state
+        while True:
+            states.append(cur)
+            if cur == (start, start_h): break
+            cur=prev.get(cur)
+            if cur is None: return None
+        states.reverse()
+        route=[]
+        for cell,_h in states:
+            if not route or route[-1] != cell:
+                route.append(cell)
+        return route
+
     def _cell_has_unvisited_open_neighbor(self, cell):
         """Return True when a scanned visited cell still borders unexplored OPEN space."""
         c = tuple(cell)
@@ -7681,7 +8870,7 @@ class DFSMapOnlyExplorer:
             c = tuple(c)
             if c == start or not self._cell_has_unvisited_open_neighbor(c):
                 continue
-            route = self.find_visited_route(start, c)
+            route = self.find_fastest_known_route(start, c)
             if not route or len(route) < 2:
                 continue
             score = self._route_time_score(route)
@@ -7847,12 +9036,28 @@ class DFSMapOnlyExplorer:
                 if MAP_AUTOSAVE:
                     self.save_map(final=False)
 
+            # A verified wide-open exit candidate is NEVER a reason to finish
+            # exploration.  Physically return to the parent, blacklist only that
+            # aperture, pop the provisional outside cell, and continue DFS.
+            if tuple(cell) in self.fake_exit_candidates:
+                if self._reject_fake_exit_and_return(cell):
+                    if stack and tuple(stack[-1]) == tuple(cell):
+                        stack.pop()
+                    if not stack or tuple(stack[-1]) != tuple(self.current):
+                        rebuilt = self.reconstruct_dfs_stack()
+                        stack = rebuilt if rebuilt else [tuple(self.current)]
+                    continue
+                break
+
             next_dir = None
             next_cell = None
             for d in self.open_dirs.get(cell, []):
                 if self.edge_is_deferred(cell, d):
                     continue
                 nb = neighbor(cell, d)
+                if FIELD_BOUNDARY_GUARD_ENABLED and not cell_in_field(nb):
+                    self.set_edge_state(cell, d, "BLOCKED")
+                    continue
                 if nb not in self.visited:
                     next_dir = d
                     next_cell = nb
@@ -7906,7 +9111,26 @@ class DFSMapOnlyExplorer:
                     self.save_map(final=False)
                 continue
 
-            # No reachable frontier remains: classic DFS parent backtrack / finish.
+            # V20.7: no useful frontier remains anywhere.  The exploration work is
+            # done; do NOT unwind the DFS parent chain edge-by-edge.  Go home over
+            # the fastest confirmed OPEN route in the map.
+            if tuple(cell) != tuple(self.root):
+                home_route = self.find_fastest_known_route(cell, self.root)
+                if home_route and len(home_route) >= 2:
+                    print(
+                        f"\n[FAST HOME] exploration frontier exhausted: {cell} -> {self.root} "
+                        f"route={home_route}"
+                    )
+                    if self.navigate_known_route(home_route):
+                        self.current = self.root
+                        stack = []
+                        break
+                    self.fault(
+                        "FAST HOME", "shortest known route failed",
+                        "fall back to classic DFS parent backtrack",
+                    )
+
+            # Fallback only if shortest-home cannot be executed safely.
             parent = self.parent.get(cell)
             if parent is None:
                 stack.pop()
@@ -7958,23 +9182,44 @@ class MissionControlGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.mission_thread = None
         self.mission_started = False
+        self.mission_finished_announced = False
+        self.status_override = None
         self.closing = False
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
         self.mission_page = ttk.Frame(self.notebook)
         self.target_page = ttk.Frame(self.notebook)
+        self.arena_page = ttk.Frame(self.notebook)
+        self.speed_page = ttk.Frame(self.notebook)
         self.notebook.add(self.mission_page, text="1. Mission / Live Map")
         self.notebook.add(self.target_page, text="2. Target Selection (16)")
+        self.notebook.add(self.arena_page, text="3. Arena / Field Setup")
+        self.notebook.add(self.speed_page, text="4. Speed / Motion Tuning")
 
-        # ---------------- Page 1: original mission page ----------------
+        # ---------------- Page 1: mission page ----------------
+        # Competition controls stay fixed at TOP-CENTER so START/STOP are always
+        # reachable without hunting through the side panel.
+        top_controls = ttk.Frame(self.mission_page, padding=(8, 8, 8, 2))
+        top_controls.pack(fill="x")
+        top_center = ttk.Frame(top_controls)
+        top_center.pack(anchor="center")
+        self.start_btn = ttk.Button(
+            top_center, text="START MISSION", width=24, command=self._start_mission
+        )
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ttk.Button(
+            top_center, text="STOP + SAVE NOW", width=24, command=self._stop_mission, state="disabled"
+        )
+        self.stop_btn.pack(side="left", padx=6)
+
         outer = ttk.Frame(self.mission_page, padding=4)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=3)
         outer.columnconfigure(1, weight=2)
         outer.rowconfigure(0, weight=1)
 
-        map_frame = ttk.LabelFrame(outer, text="Live Map / Round-2 Hints")
+        map_frame = ttk.LabelFrame(outer, text="Live Map | Orange=Breadcrumb | Purple=Round-2 Shortest Preview")
         map_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         map_frame.rowconfigure(0, weight=1)
         map_frame.columnconfigure(0, weight=1)
@@ -8007,9 +9252,37 @@ class MissionControlGUI:
         ).pack(anchor="w")
         ttk.Label(
             mode_box,
-            text="Round 2 loads maps/round1_attack_memory.json and visits only proven firing cells.",
+            text=(
+                "ROUND 2: load ONLY maps/round1_attack_memory.json. "
+                "This ONE file contains the learned map + proven firing anchors + saved target classes. "
+                "Do NOT load latest_map.json or latest_targets.json separately."
+            ),
             wraplength=340,
+            justify="left",
         ).pack(anchor="w", pady=(5, 0))
+
+        memory_row = ttk.Frame(mode_box)
+        memory_row.pack(fill="x", pady=(7, 0))
+        ttk.Button(
+            memory_row, text="1) LOAD ROUND-1 MAP + SHOT POINTS", command=self._load_round1_snapshot
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            memory_row, text="2) PREVIEW SHORTEST ROUTE", command=self._preview_round2_route
+        ).pack(side="left")
+        ttk.Button(
+            mode_box, text="LOAD DEFAULT + PREVIEW ROUND 2",
+            command=self._load_default_and_preview_round2
+        ).pack(anchor="w", pady=(7, 0))
+        self.memory_status_text = tk.StringVar(
+            value="Round-2 snapshot: not loaded (default maps/round1_attack_memory.json)"
+        )
+        ttk.Label(
+            mode_box, textvariable=self.memory_status_text, wraplength=340, justify="left"
+        ).pack(anchor="w", pady=(5, 0))
+        self.route_preview_text = tk.StringVar(value="Route preview: not built")
+        ttk.Label(
+            mode_box, textvariable=self.route_preview_text, wraplength=340, justify="left"
+        ).pack(anchor="w", pady=(3, 0))
 
         fire_box = ttk.LabelFrame(side, text="Fire Type / Burst", padding=8)
         fire_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -8057,15 +9330,6 @@ class MissionControlGUI:
         aim_box.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self.aim_text = tk.StringVar(value="No fire solution yet")
         ttk.Label(aim_box, textvariable=self.aim_text, justify="left", wraplength=340).pack(anchor="w")
-
-        controls = ttk.Frame(side)
-        controls.grid(row=5, column=0, sticky="ew")
-        controls.columnconfigure(0, weight=1)
-        controls.columnconfigure(1, weight=1)
-        self.start_btn = ttk.Button(controls, text="START MISSION", command=self._start_mission)
-        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.stop_btn = ttk.Button(controls, text="STOP", command=self._stop_mission)
-        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         # ---------------- Page 2: 16 color x shape rules ----------------
         target_outer = ttk.Frame(self.target_page, padding=14)
@@ -8124,12 +9388,611 @@ class MissionControlGUI:
             justify="left",
         ).grid(row=9, column=0, columnspan=5, sticky="w", pady=(10, 0))
 
+        # ---------------- Page 3: generic arena / field setup ----------------
+        arena_outer = ttk.Frame(self.arena_page, padding=14)
+        arena_outer.pack(fill="both", expand=True)
+        arena_outer.columnconfigure(0, weight=1)
+        arena_outer.columnconfigure(1, weight=2)
+        arena_outer.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            arena_outer,
+            text=(
+                "Generic arena geometry. The DFS has no special fake-exit coordinate: any sensed OPEN edge "
+                "whose destination falls outside these bounds is rejected BEFORE translation. "
+                "Apply before Round 1. Round 2 automatically restores the geometry saved in the Round-1 snapshot."
+            ),
+            wraplength=980, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+
+        arena_form = ttk.LabelFrame(arena_outer, text="Arena Profile", padding=12)
+        arena_form.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        arena_form.columnconfigure(1, weight=1)
+
+        active_profile = current_arena_profile()
+        self.arena_name_var = tk.StringVar(value=str(active_profile["name"]))
+        self.arena_width_var = tk.StringVar(value=str(active_profile["width_cells"]))
+        self.arena_height_var = tk.StringVar(value=str(active_profile["height_cells"]))
+        self.arena_xmin_var = tk.StringVar(value=str(active_profile["x_min"]))
+        self.arena_ymin_var = tk.StringVar(value=str(active_profile["y_min"]))
+        self.arena_startx_var = tk.StringVar(value=str(active_profile["start_cell"][0]))
+        self.arena_starty_var = tk.StringVar(value=str(active_profile["start_cell"][1]))
+        self.arena_boundary_var = tk.BooleanVar(value=bool(active_profile["boundary_guard"]))
+
+        arena_fields = (
+            ("Profile name", self.arena_name_var),
+            ("Width (cells)", self.arena_width_var),
+            ("Height (cells)", self.arena_height_var),
+            ("X minimum", self.arena_xmin_var),
+            ("Y minimum", self.arena_ymin_var),
+            ("Start X", self.arena_startx_var),
+            ("Start Y", self.arena_starty_var),
+        )
+        for row_i, (label, var) in enumerate(arena_fields):
+            ttk.Label(arena_form, text=label + ":").grid(row=row_i, column=0, sticky="w", pady=4, padx=(0, 8))
+            ttk.Entry(arena_form, textvariable=var, width=18).grid(row=row_i, column=1, sticky="ew", pady=4)
+
+        ttk.Checkbutton(
+            arena_form, text="Boundary Guard (reject moves outside arena)",
+            variable=self.arena_boundary_var, command=self._draw_arena_preview,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        arena_buttons = ttk.Frame(arena_form)
+        arena_buttons.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        ttk.Button(
+            arena_buttons, text="APPLY TO ROUND 1", command=self._apply_arena_from_gui
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(arena_buttons, text="LOAD JSON", command=self._load_arena_json).pack(side="left", padx=(0, 6))
+        ttk.Button(arena_buttons, text="SAVE JSON", command=self._save_arena_json).pack(side="left", padx=(0, 6))
+        ttk.Button(arena_buttons, text="RESET DEFAULT", command=self._reset_arena_defaults).pack(side="left")
+
+        self.arena_status_text = tk.StringVar(value="Arena settings ready. Apply before START.")
+        ttk.Label(
+            arena_form, textvariable=self.arena_status_text, wraplength=390, justify="left"
+        ).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        arena_preview_box = ttk.LabelFrame(arena_outer, text="Arena Preview", padding=8)
+        arena_preview_box.grid(row=1, column=1, sticky="nsew")
+        arena_preview_box.rowconfigure(0, weight=1)
+        arena_preview_box.columnconfigure(0, weight=1)
+        self.arena_canvas = tk.Canvas(
+            arena_preview_box, width=520, height=500, background="white", highlightthickness=0
+        )
+        self.arena_canvas.grid(row=0, column=0, sticky="nsew")
+        self.arena_preview_text = tk.StringVar(value="")
+        ttk.Label(
+            arena_preview_box, textvariable=self.arena_preview_text, justify="left", wraplength=520
+        ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        # Redraw the field preview while typing; invalid intermediate input is simply ignored.
+        for var in (
+            self.arena_width_var, self.arena_height_var, self.arena_xmin_var, self.arena_ymin_var,
+            self.arena_startx_var, self.arena_starty_var, self.arena_name_var,
+        ):
+            try:
+                var.trace_add("write", lambda *_args: self._draw_arena_preview())
+            except Exception:
+                pass
+
+        # ---------------- Page 4: speed / motion tuning ----------------
+        speed_outer = ttk.Frame(self.speed_page, padding=14)
+        speed_outer.pack(fill="both", expand=True)
+        speed_outer.columnconfigure(0, weight=1)
+        speed_outer.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            speed_outer,
+            text=(
+                "Set mission motion limits here. Values are validated before applying. "
+                "Speed changes are locked while a mission is running so one cell cannot change profile mid-run. "
+                "The live panel keeps showing commanded and odometry-estimated speed."
+            ),
+            wraplength=980, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+
+        tune_box = ttk.LabelFrame(speed_outer, text="Motion Limits", padding=12)
+        tune_box.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        tune_box.columnconfigure(1, weight=1)
+
+        self.speed_explore_var = tk.StringVar(value=f"{DFS_EXPLORE_SPEED_MPS:.3f}")
+        self.speed_known_var = tk.StringVar(value=f"{DFS_KNOWN_SPEED_MPS:.3f}")
+        self.speed_explore_min_var = tk.StringVar(value=f"{DFS_EXPLORE_APPROACH_MIN_MPS:.3f}")
+        self.speed_known_min_var = tk.StringVar(value=f"{DFS_KNOWN_APPROACH_MIN_MPS:.3f}")
+        self.speed_target_fast_var = tk.StringVar(value=f"{TARGET_SIDE_SHIFT_SPEED_MPS:.3f}")
+        self.speed_target_med_var = tk.StringVar(value=f"{TARGET_SIDE_SHIFT_MED_SPEED_MPS:.3f}")
+        self.speed_target_slow_var = tk.StringVar(value=f"{TARGET_SIDE_SHIFT_SLOW_MPS:.3f}")
+        self.speed_ir_var = tk.StringVar(value=f"{IR_SIMPLE_STRAFE_SPEED_MPS:.3f}")
+        self.speed_sharp_var = tk.StringVar(value=f"{SHARP_SIDE_ESCAPE_SPEED_MPS:.3f}")
+        self.speed_turn_var = tk.StringVar(value=f"{TURN_MAX_DPS:.1f}")
+        self.speed_accel_var = tk.StringVar(value=f"{MOVE_FORWARD_ACCEL_LIMIT_MPS2:.2f}")
+        self.speed_settle_var = tk.StringVar(value=f"{POST_MOVE_TILE_SETTLE_SEC:.3f}")
+
+        speed_fields = (
+            ("Explore cruise (m/s)", self.speed_explore_var),
+            ("Known / Backtrack / Round2 (m/s)", self.speed_known_var),
+            ("Explore approach min (m/s)", self.speed_explore_min_var),
+            ("Known approach min (m/s)", self.speed_known_min_var),
+            ("Target side shift FAST (m/s)", self.speed_target_fast_var),
+            ("Target side shift MED (m/s)", self.speed_target_med_var),
+            ("Target side shift SLOW (m/s)", self.speed_target_slow_var),
+            ("IR side recovery base (m/s)", self.speed_ir_var),
+            ("Sharp side escape (m/s)", self.speed_sharp_var),
+            ("Turn max (deg/s)", self.speed_turn_var),
+            ("Forward accel limit (m/s^2)", self.speed_accel_var),
+            ("Post-cell settle (s)", self.speed_settle_var),
+        )
+        for ri, (label, var) in enumerate(speed_fields):
+            ttk.Label(tune_box, text=label + ":").grid(row=ri, column=0, sticky="w", pady=3, padx=(0, 8))
+            ttk.Entry(tune_box, textvariable=var, width=12).grid(row=ri, column=1, sticky="ew", pady=3)
+
+        preset_row = ttk.Frame(tune_box)
+        preset_row.grid(row=len(speed_fields), column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        ttk.Label(preset_row, text="Preset:").pack(side="left", padx=(0, 6))
+        ttk.Button(preset_row, text="SLIPPERY SAFE", command=lambda: self._load_speed_preset("SAFE")).pack(side="left", padx=(0, 5))
+        ttk.Button(preset_row, text="BALANCED", command=lambda: self._load_speed_preset("BALANCED")).pack(side="left", padx=(0, 5))
+        ttk.Button(preset_row, text="FAST", command=lambda: self._load_speed_preset("FAST")).pack(side="left")
+
+        action_row = ttk.Frame(tune_box)
+        action_row.grid(row=len(speed_fields)+1, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+        self.speed_apply_btn = ttk.Button(action_row, text="APPLY SPEED SETTINGS", command=self._apply_speed_from_gui)
+        self.speed_apply_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(action_row, text="RESTORE CURRENT", command=self._sync_speed_vars_from_runtime).pack(side="left")
+        self.speed_status_text = tk.StringVar(value="Speed settings ready. Apply before START.")
+        ttk.Label(tune_box, textvariable=self.speed_status_text, wraplength=430, justify="left").grid(
+            row=len(speed_fields)+2, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+
+        live_box = ttk.LabelFrame(speed_outer, text="Live Chassis Speed", padding=12)
+        live_box.grid(row=1, column=1, sticky="nsew")
+        live_box.columnconfigure(0, weight=1)
+        self.speed_live_text = tk.StringVar(value="Robot not moving / telemetry not connected yet")
+        ttk.Label(
+            live_box, textvariable=self.speed_live_text, justify="left",
+            font=("TkFixedFont", 11), wraplength=480,
+        ).grid(row=0, column=0, sticky="nw")
+        ttk.Label(
+            live_box,
+            text=(
+                "Commanded = velocity requested by this program.\n"
+                "Measured = filtered estimate from chassis odometry callbacks.\n"
+                "Forward/Right are projected into the current logical heading."
+            ),
+            wraplength=470, justify="left",
+        ).grid(row=1, column=0, sticky="nw", pady=(12, 0))
+
         self._target_filter_changed()
+        self._draw_arena_preview()
         self._refresh()
+
+    def _arena_profile_from_vars(self):
+        """Validate and return the profile currently typed in the Arena tab."""
+        name = str(self.arena_name_var.get() or "gui_arena").strip() or "gui_arena"
+        try:
+            width = int(str(self.arena_width_var.get()).strip())
+            height = int(str(self.arena_height_var.get()).strip())
+            x_min = int(str(self.arena_xmin_var.get()).strip())
+            y_min = int(str(self.arena_ymin_var.get()).strip())
+            start_x = int(str(self.arena_startx_var.get()).strip())
+            start_y = int(str(self.arena_starty_var.get()).strip())
+        except Exception:
+            raise ValueError("width/height/origin/start must be integers")
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be > 0")
+        if width > 100 or height > 100:
+            raise ValueError("width/height > 100 cells is rejected as likely input error")
+        x_max = x_min + width - 1
+        y_max = y_min + height - 1
+        if not (x_min <= start_x <= x_max and y_min <= start_y <= y_max):
+            raise ValueError(
+                "start ({},{}) is outside x={}..{}, y={}..{}".format(
+                    start_x, start_y, x_min, x_max, y_min, y_max
+                )
+            )
+        return {
+            "name": name,
+            "width_cells": width,
+            "height_cells": height,
+            "x_min": x_min,
+            "y_min": y_min,
+            "start_cell": [start_x, start_y],
+            "boundary_guard": bool(self.arena_boundary_var.get()),
+        }
+
+    def _sync_arena_vars_from_runtime(self):
+        profile = current_arena_profile()
+        self.arena_name_var.set(str(profile["name"]))
+        self.arena_width_var.set(str(profile["width_cells"]))
+        self.arena_height_var.set(str(profile["height_cells"]))
+        self.arena_xmin_var.set(str(profile["x_min"]))
+        self.arena_ymin_var.set(str(profile["y_min"]))
+        self.arena_startx_var.set(str(profile["start_cell"][0]))
+        self.arena_starty_var.set(str(profile["start_cell"][1]))
+        self.arena_boundary_var.set(bool(profile["boundary_guard"]))
+        self._draw_arena_preview()
+
+    def _apply_arena_from_gui(self, quiet=False):
+        if self.mission_started:
+            if not quiet:
+                self.arena_status_text.set("LOCKED: stop/restart before changing arena geometry.")
+            return False
+        try:
+            profile = self._arena_profile_from_vars()
+            apply_arena_profile(profile, source="GUI Arena tab")
+            # New geometry means a fresh Round-1 logical frame.  Never keep an old
+            # map loaded under different coordinates/bounds.
+            self.explorer.reset_map_for_fresh_round1()
+            self.round_var.set("ROUND1")
+            self.explorer.set_mission_mode("ROUND1")
+            self.memory_status_text.set(
+                "Round-2 snapshot cleared from RAM; new arena requires a fresh Round 1"
+            )
+            self.route_preview_text.set("Route preview: not built")
+            self._sync_arena_vars_from_runtime()
+            self.status_override = None
+            self.status_text.set("ARENA APPLIED - ready for fresh ROUND1")
+            self.arena_status_text.set(
+                "APPLIED: {}x{} | x={}..{} y={}..{} | start={} | boundary_guard={}".format(
+                    GRID_WIDTH_CELLS, GRID_HEIGHT_CELLS, GRID_X_MIN, GRID_X_MAX,
+                    GRID_Y_MIN, GRID_Y_MAX, ROOT_CELL, FIELD_BOUNDARY_GUARD_ENABLED
+                )
+            )
+            return True
+        except Exception as exc:
+            msg = "ARENA INVALID: {}".format(exc)
+            self.arena_status_text.set(msg)
+            if not quiet:
+                self.status_text.set(msg)
+            return False
+
+    def _load_arena_json(self):
+        if self.mission_started:
+            self.arena_status_text.set("LOCKED: cannot load arena JSON while mission is running")
+            return False
+        if filedialog is None:
+            self.arena_status_text.set("File dialog unavailable")
+            return False
+        path = filedialog.askopenfilename(
+            title="Load Arena Profile", initialdir=str(Path.cwd()),
+            filetypes=(("Arena JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return False
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("arena JSON must contain one object")
+            merged = dict(DEFAULT_ARENA_PROFILE)
+            merged.update(payload)
+            start = merged.get("start_cell", [0, 0])
+            self.arena_name_var.set(str(merged.get("name") or Path(path).stem))
+            self.arena_width_var.set(str(merged.get("width_cells")))
+            self.arena_height_var.set(str(merged.get("height_cells")))
+            self.arena_xmin_var.set(str(merged.get("x_min", 0)))
+            self.arena_ymin_var.set(str(merged.get("y_min", 0)))
+            self.arena_startx_var.set(str(start[0]))
+            self.arena_starty_var.set(str(start[1]))
+            self.arena_boundary_var.set(bool(merged.get("boundary_guard", True)))
+            self.arena_status_text.set("Loaded into editor: {} (press APPLY TO ROUND 1)".format(path))
+            self._draw_arena_preview()
+            return True
+        except Exception as exc:
+            self.arena_status_text.set("LOAD FAILED: {}: {}".format(type(exc).__name__, exc))
+            return False
+
+    def _save_arena_json(self):
+        if filedialog is None:
+            self.arena_status_text.set("File dialog unavailable")
+            return False
+        try:
+            profile = self._arena_profile_from_vars()
+        except Exception as exc:
+            self.arena_status_text.set("SAVE BLOCKED - invalid arena: {}".format(exc))
+            return False
+        path = filedialog.asksaveasfilename(
+            title="Save Arena Profile", initialdir=str(Path.cwd()),
+            initialfile="arena_config.json", defaultextension=".json",
+            filetypes=(("Arena JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return False
+        try:
+            Path(path).write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.arena_status_text.set("Saved arena profile: {}".format(path))
+            return True
+        except Exception as exc:
+            self.arena_status_text.set("SAVE FAILED: {}: {}".format(type(exc).__name__, exc))
+            return False
+
+    def _reset_arena_defaults(self):
+        if self.mission_started:
+            self.arena_status_text.set("LOCKED: cannot reset arena while mission is running")
+            return False
+        p = dict(DEFAULT_ARENA_PROFILE)
+        start = p.get("start_cell", [0, 0])
+        self.arena_name_var.set(str(p.get("name", "competition_default")))
+        self.arena_width_var.set(str(p.get("width_cells", 6)))
+        self.arena_height_var.set(str(p.get("height_cells", 6)))
+        self.arena_xmin_var.set(str(p.get("x_min", 0)))
+        self.arena_ymin_var.set(str(p.get("y_min", 0)))
+        self.arena_startx_var.set(str(start[0]))
+        self.arena_starty_var.set(str(start[1]))
+        self.arena_boundary_var.set(bool(p.get("boundary_guard", True)))
+        self.arena_status_text.set("Default loaded into editor; press APPLY TO ROUND 1")
+        self._draw_arena_preview()
+        return True
+
+    def _draw_arena_preview(self):
+        canvas = getattr(self, "arena_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        try:
+            p = self._arena_profile_from_vars()
+        except Exception as exc:
+            self.arena_preview_text.set("Preview unavailable: {}".format(exc))
+            return
+        w = int(p["width_cells"]); h = int(p["height_cells"])
+        xmin = int(p["x_min"]); ymin = int(p["y_min"])
+        xmax = xmin + w - 1; ymax = ymin + h - 1
+        sx, sy = int(p["start_cell"][0]), int(p["start_cell"][1])
+        cw = max(360, int(canvas.winfo_width() or 520))
+        ch = max(360, int(canvas.winfo_height() or 500))
+        pad = 34.0
+        cell_px = max(10.0, min((cw - 2*pad) / max(1, w), (ch - 2*pad) / max(1, h)))
+        grid_w = cell_px * w; grid_h = cell_px * h
+        ox = (cw - grid_w) / 2.0; oy = (ch - grid_h) / 2.0
+        for yy in range(h):
+            for xx in range(w):
+                gx = xmin + xx; gy = ymin + yy
+                x0 = ox + xx * cell_px
+                # Logical +Y is North/up, so max Y is drawn at the top.
+                y0 = oy + (ymax - gy) * cell_px
+                canvas.create_rectangle(x0, y0, x0+cell_px, y0+cell_px, outline="#777777")
+                if cell_px >= 34:
+                    canvas.create_text(x0+cell_px/2, y0+cell_px/2, text="{},{}".format(gx, gy), fill="#777777")
+                if (gx, gy) == (sx, sy):
+                    margin = max(3.0, cell_px * 0.16)
+                    canvas.create_oval(
+                        x0+margin, y0+margin, x0+cell_px-margin, y0+cell_px-margin,
+                        fill="#d9ecff", outline="#1f5f99", width=2,
+                    )
+                    canvas.create_text(x0+cell_px/2, y0+cell_px/2, text="START\nN↑", fill="#103b63")
+        border_width = 5 if p["boundary_guard"] else 2
+        border_dash = None if p["boundary_guard"] else (6, 4)
+        canvas.create_rectangle(ox, oy, ox+grid_w, oy+grid_h, outline="#111111", width=border_width, dash=border_dash)
+        self.arena_preview_text.set(
+            "{} | {}x{} | bounds x={}..{}, y={}..{} | start=({}, {}) facing N | Boundary Guard={}".format(
+                p["name"], w, h, xmin, xmax, ymin, ymax, sx, sy, "ON" if p["boundary_guard"] else "OFF"
+            )
+        )
+
+    def _sync_speed_vars_from_runtime(self):
+        self.speed_explore_var.set(f"{DFS_EXPLORE_SPEED_MPS:.3f}")
+        self.speed_known_var.set(f"{DFS_KNOWN_SPEED_MPS:.3f}")
+        self.speed_explore_min_var.set(f"{DFS_EXPLORE_APPROACH_MIN_MPS:.3f}")
+        self.speed_known_min_var.set(f"{DFS_KNOWN_APPROACH_MIN_MPS:.3f}")
+        self.speed_target_fast_var.set(f"{TARGET_SIDE_SHIFT_SPEED_MPS:.3f}")
+        self.speed_target_med_var.set(f"{TARGET_SIDE_SHIFT_MED_SPEED_MPS:.3f}")
+        self.speed_target_slow_var.set(f"{TARGET_SIDE_SHIFT_SLOW_MPS:.3f}")
+        self.speed_ir_var.set(f"{IR_SIMPLE_STRAFE_SPEED_MPS:.3f}")
+        self.speed_sharp_var.set(f"{SHARP_SIDE_ESCAPE_SPEED_MPS:.3f}")
+        self.speed_turn_var.set(f"{TURN_MAX_DPS:.1f}")
+        self.speed_accel_var.set(f"{MOVE_FORWARD_ACCEL_LIMIT_MPS2:.2f}")
+        self.speed_settle_var.set(f"{POST_MOVE_TILE_SETTLE_SEC:.3f}")
+        self.speed_status_text.set("Editor restored to currently active motion settings.")
+
+    def _load_speed_preset(self, name):
+        if self.mission_started:
+            self.speed_status_text.set("LOCKED: stop the mission before changing speed preset.")
+            return False
+        presets = {
+            "SAFE": {"explore":0.26,"known":0.40,"emin":0.09,"kmin":0.11,"tfast":0.155,"tmed":0.105,"tslow":0.055,"ir":0.075,"sharp":0.080,"turn":65.0,"accel":0.65,"settle":0.11},
+            "BALANCED": {"explore":0.31,"known":0.48,"emin":0.10,"kmin":0.13,"tfast":0.185,"tmed":0.120,"tslow":0.065,"ir":0.085,"sharp":0.090,"turn":75.0,"accel":0.80,"settle":0.08},
+            "FAST": {"explore":0.36,"known":0.56,"emin":0.12,"kmin":0.15,"tfast":0.215,"tmed":0.140,"tslow":0.075,"ir":0.095,"sharp":0.100,"turn":85.0,"accel":1.00,"settle":0.06},
+        }
+        p = presets.get(str(name).upper(), presets["BALANCED"])
+        self.speed_explore_var.set(str(p["explore"])); self.speed_known_var.set(str(p["known"]))
+        self.speed_explore_min_var.set(str(p["emin"])); self.speed_known_min_var.set(str(p["kmin"]))
+        self.speed_target_fast_var.set(str(p["tfast"])); self.speed_target_med_var.set(str(p["tmed"]))
+        self.speed_target_slow_var.set(str(p["tslow"])); self.speed_ir_var.set(str(p["ir"]))
+        self.speed_sharp_var.set(str(p["sharp"])); self.speed_turn_var.set(str(p["turn"]))
+        self.speed_accel_var.set(str(p["accel"])); self.speed_settle_var.set(str(p["settle"]))
+        self.speed_status_text.set("{} preset loaded; press APPLY SPEED SETTINGS.".format(name))
+        return True
+
+    def _apply_speed_from_gui(self, quiet=False):
+        global DFS_EXPLORE_SPEED_MPS, DFS_KNOWN_SPEED_MPS
+        global DFS_EXPLORE_APPROACH_MIN_MPS, DFS_KNOWN_APPROACH_MIN_MPS
+        global TARGET_SIDE_SHIFT_SPEED_MPS, TARGET_SIDE_SHIFT_MED_SPEED_MPS, TARGET_SIDE_SHIFT_SLOW_MPS
+        global IR_SIMPLE_STRAFE_SPEED_MPS, IR_SIMPLE_STRAFE_FAST_MPS, IR_SIMPLE_STRAFE_SLOW_MPS
+        global SHARP_SIDE_ESCAPE_SPEED_MPS, TURN_MAX_DPS, MOVE_FORWARD_ACCEL_LIMIT_MPS2
+        global POST_MOVE_TILE_SETTLE_SEC, MAX_CELL_TIME_SEC
+        if self.mission_started:
+            if not quiet:
+                self.speed_status_text.set("LOCKED: STOP mission before applying new speeds.")
+            return False
+        try:
+            ex=float(self.speed_explore_var.get()); kn=float(self.speed_known_var.get())
+            emin=float(self.speed_explore_min_var.get()); kmin=float(self.speed_known_min_var.get())
+            tf=float(self.speed_target_fast_var.get()); tm=float(self.speed_target_med_var.get())
+            ts=float(self.speed_target_slow_var.get()); ir=float(self.speed_ir_var.get())
+            sh=float(self.speed_sharp_var.get()); turn=float(self.speed_turn_var.get())
+            accel=float(self.speed_accel_var.get()); settle=float(self.speed_settle_var.get())
+            vals=[ex,kn,emin,kmin,tf,tm,ts,ir,sh,turn,accel,settle]
+            if not all(math.isfinite(v) for v in vals): raise ValueError("all values must be finite numbers")
+            if not 0.08 <= ex <= 0.60: raise ValueError("Explore cruise must be 0.08..0.60 m/s")
+            if not 0.08 <= kn <= 0.75: raise ValueError("Known/Backtrack/Round2 must be 0.08..0.75 m/s")
+            if not 0.04 <= emin <= ex: raise ValueError("Explore approach min must be 0.04..Explore cruise")
+            if not 0.04 <= kmin <= kn: raise ValueError("Known approach min must be 0.04..Known cruise")
+            if not 0.05 <= tf <= 0.30: raise ValueError("Target FAST must be 0.05..0.30 m/s")
+            if not 0.04 <= tm <= tf: raise ValueError("Target MED must be 0.04..Target FAST")
+            if not 0.025 <= ts <= tm: raise ValueError("Target SLOW must be 0.025..Target MED")
+            if not 0.04 <= ir <= 0.16: raise ValueError("IR side base must be 0.04..0.16 m/s")
+            if not 0.04 <= sh <= 0.18: raise ValueError("Sharp escape must be 0.04..0.18 m/s")
+            if not 35.0 <= turn <= 110.0: raise ValueError("Turn max must be 35..110 deg/s")
+            if not 0.30 <= accel <= 1.60: raise ValueError("Accel limit must be 0.30..1.60 m/s^2")
+            if not 0.02 <= settle <= 0.25: raise ValueError("Post-cell settle must be 0.02..0.25 s")
+            DFS_EXPLORE_SPEED_MPS=ex; DFS_KNOWN_SPEED_MPS=kn
+            DFS_EXPLORE_APPROACH_MIN_MPS=emin; DFS_KNOWN_APPROACH_MIN_MPS=kmin
+            TARGET_SIDE_SHIFT_SPEED_MPS=tf; TARGET_SIDE_SHIFT_MED_SPEED_MPS=tm; TARGET_SIDE_SHIFT_SLOW_MPS=ts
+            IR_SIMPLE_STRAFE_SPEED_MPS=ir
+            IR_SIMPLE_STRAFE_FAST_MPS=min(0.20, ir*(0.110/0.085))
+            IR_SIMPLE_STRAFE_SLOW_MPS=max(0.035, ir*(0.060/0.085))
+            SHARP_SIDE_ESCAPE_SPEED_MPS=sh; TURN_MAX_DPS=turn
+            MOVE_FORWARD_ACCEL_LIMIT_MPS2=accel; POST_MOVE_TILE_SETTLE_SEC=settle
+            MAX_CELL_TIME_SEC=max(6.0,(CELL_LENGTH_M/max(0.05,DFS_EXPLORE_SPEED_MPS))*2.8)
+            self.explorer.pid_turn.out_limit=abs(float(TURN_MAX_DPS))
+            self._sync_speed_vars_from_runtime()
+            self.speed_status_text.set("APPLIED: Explore={:.2f} | Known/R2={:.2f} m/s | Turn={:.0f} deg/s | Accel={:.2f}".format(ex,kn,turn,accel))
+            return True
+        except Exception as exc:
+            msg="SPEED INVALID: {}".format(exc)
+            self.speed_status_text.set(msg)
+            if not quiet: self.status_text.set(msg)
+            return False
 
     def _round_changed(self):
         if not self.mission_started:
-            self.explorer.set_mission_mode(self.round_var.get())
+            mode = self.round_var.get()
+            if mode == "ROUND1" and self.explorer.round1_memory is not None:
+                self.explorer.reset_map_for_fresh_round1()
+                self.memory_status_text.set(
+                    "Round-2 snapshot cleared from RAM; Round 1 will start a fresh map"
+                )
+                self.route_preview_text.set("Route preview: not built")
+            self.explorer.set_mission_mode(mode)
+            if mode == "ROUND2" and self.explorer.round1_memory is not None:
+                self._preview_round2_route(show_fault=False)
+
+    def _format_preview_status(self, plan):
+        if not plan:
+            return "Route preview: unavailable"
+        route = plan.get("route_cells") or []
+        anchors = plan.get("anchor_order") or []
+        return (
+            "Route preview: {} target-hint(s), {} firing cell(s), {} step(s), ~{:.2f} m\n"
+            "Anchor order: {}\nPath: {}"
+        ).format(
+            int(plan.get("selected_hint_count", 0)), int(plan.get("anchor_count", 0)),
+            int(plan.get("total_steps", 0)), float(plan.get("total_distance_m", 0.0)),
+            " -> ".join(str(tuple(c)) for c in anchors) if anchors else "(none)",
+            " -> ".join(str(tuple(c)) for c in route) if route else "(none)",
+        )
+
+    def _load_round1_snapshot(self):
+        if self.mission_started:
+            self.status_text.set("Cannot change Round-2 snapshot while mission is running")
+            return False
+        path = None
+        if filedialog is not None:
+            try:
+                path = filedialog.askopenfilename(
+                    title="Load Round-1 map + firing snapshot",
+                    initialdir=str(MAP_DIR.resolve()),
+                    initialfile=ROUND1_ATTACK_MEMORY_JSON.name,
+                    filetypes=(("Round-1 snapshot", "*.json"), ("All files", "*.*")),
+                )
+            except Exception:
+                path = None
+            if not path:
+                return False
+        else:
+            path = str(ROUND1_ATTACK_MEMORY_JSON)
+
+        if not self.explorer.load_round1_attack_memory(path):
+            self.memory_status_text.set("LOAD FAILED: {}".format(path))
+            self.route_preview_text.set("Route preview: unavailable")
+            return False
+
+        self.round_var.set("ROUND2")
+        self.explorer.set_mission_mode("ROUND2")
+        self._sync_arena_vars_from_runtime()
+        self.arena_status_text.set("Arena restored from loaded Round-1 snapshot (Round 2 authoritative geometry)")
+        saved_pairs = []
+        for row in (self.explorer.round1_memory or {}).get("selected_target_classes", []):
+            if isinstance(row, dict):
+                key = (str(row.get("color") or "").upper(), str(row.get("shape") or "").upper())
+                if key in self.target_vars:
+                    saved_pairs.append(key)
+        if saved_pairs:
+            selected_set = set(saved_pairs)
+            for key, var in self.target_vars.items():
+                var.set(key in selected_set)
+            self._target_filter_changed()
+        self.memory_status_text.set(
+            "Loaded: {} | cells={} | firing hints={} | breadcrumbs={} | map_complete={}".format(
+                self.explorer.round1_memory_path, len(self.explorer.visited),
+                len(self.explorer.round2_hints), len(self.explorer.breadcrumb_snapshot()),
+                self.explorer.map_complete
+            )
+        )
+        self._preview_round2_route(show_fault=True)
+        return True
+
+    def _load_default_and_preview_round2(self):
+        """One-click competition path: load standard Round-1 bundle then preview."""
+        if self.mission_started:
+            self.status_text.set("Cannot load Round-2 snapshot while mission is running")
+            return False
+        path = Path(ROUND1_ATTACK_MEMORY_JSON)
+        if not self.explorer.load_round1_attack_memory(path):
+            self.memory_status_text.set("LOAD FAILED: {}".format(path))
+            self.route_preview_text.set("Route preview: unavailable")
+            return False
+        self.round_var.set("ROUND2")
+        self.explorer.set_mission_mode("ROUND2")
+        self._sync_arena_vars_from_runtime()
+        self.arena_status_text.set("Arena restored from loaded Round-1 snapshot (Round 2 authoritative geometry)")
+
+        saved_pairs = []
+        for row in (self.explorer.round1_memory or {}).get("selected_target_classes", []):
+            if isinstance(row, dict):
+                key = (str(row.get("color") or "").upper(), str(row.get("shape") or "").upper())
+                if key in self.target_vars:
+                    saved_pairs.append(key)
+        if saved_pairs:
+            selected_set = set(saved_pairs)
+            for key, var in self.target_vars.items():
+                var.set(key in selected_set)
+            self._target_filter_changed()
+
+        self.memory_status_text.set(
+            "Loaded DEFAULT: {} | cells={} | firing hints={} | map_complete={}".format(
+                path, len(self.explorer.visited), len(self.explorer.round2_hints),
+                self.explorer.map_complete,
+            )
+        )
+        return self._preview_round2_route(show_fault=True)
+
+    def _preview_round2_route(self, show_fault=True):
+        if self.mission_started:
+            return False
+        if self.explorer.round1_memory is None:
+            default_path = Path(self.explorer.round1_memory_path)
+            if not default_path.exists() or not self.explorer.load_round1_attack_memory(default_path):
+                if show_fault:
+                    self.route_preview_text.set(
+                        "Route preview: load maps/round1_attack_memory.json first"
+                    )
+                return False
+            self._sync_arena_vars_from_runtime()
+            self.arena_status_text.set("Arena restored from auto-loaded Round-1 snapshot")
+            self.memory_status_text.set(
+                "Loaded default: {} | cells={} | firing hints={} | breadcrumbs={}".format(
+                    default_path, len(self.explorer.visited), len(self.explorer.round2_hints),
+                    len(self.explorer.breadcrumb_snapshot())
+                )
+            )
+        try:
+            plan = self.explorer.build_round2_preview_plan()
+            self.route_preview_text.set(self._format_preview_status(plan))
+            return True
+        except Exception as exc:
+            if show_fault:
+                self.route_preview_text.set(
+                    "Route preview failed: {}: {}".format(type(exc).__name__, exc)
+                )
+            return False
 
     def _fire_changed(self):
         self.explorer.set_fire_mode(self.fire_var.get())
@@ -8141,6 +10004,11 @@ class MissionControlGUI:
         selected = [key for key, var in self.target_vars.items() if bool(var.get())]
         self.explorer.set_target_selection(selected)
         self.target_filter_text.set("{} / 16 target classes enabled".format(len(selected)))
+        if (
+            not self.mission_started and self.round_var.get() == "ROUND2"
+            and self.explorer.round1_memory is not None
+        ):
+            self._preview_round2_route(show_fault=False)
 
     def _select_all_targets(self):
         for var in self.target_vars.values():
@@ -8155,13 +10023,62 @@ class MissionControlGUI:
     def _start_mission(self):
         if self.mission_started:
             return
+
+        requested_mode = self.round_var.get()
+        # START consumes the currently visible speed editor values too.
+        if not self._apply_speed_from_gui(quiet=True):
+            self.status_text.set("MISSION NOT STARTED - fix Speed / Motion Tuning values")
+            self.notebook.select(self.speed_page)
+            return
+        if requested_mode == "ROUND1":
+            # START always consumes the values currently visible in Arena / Field Setup,
+            # so forgetting to press APPLY cannot silently run an old geometry.
+            if not self._apply_arena_from_gui(quiet=True):
+                self.status_text.set("ROUND1 NOT STARTED - fix Arena / Field Setup values")
+                self.notebook.select(self.arena_page)
+                return
+            requested_mode = "ROUND1"
+        if requested_mode == "ROUND1" and self.explorer.round1_memory is not None:
+            self.explorer.reset_map_for_fresh_round1()
+        if requested_mode == "ROUND2":
+            # Round 2 must have a frozen Round-1 bundle before the robot connects.
+            # If the user did not press LOAD, transparently try the standard file.
+            if self.explorer.round1_memory is None:
+                if not self.explorer.load_round1_attack_memory(self.explorer.round1_memory_path):
+                    self.status_text.set(
+                        "ROUND2 NOT STARTED - load maps/round1_attack_memory.json first"
+                    )
+                    return
+                self.memory_status_text.set(
+                    "Loaded default: {} | cells={} | firing hints={}".format(
+                        self.explorer.round1_memory_path, len(self.explorer.visited),
+                        len(self.explorer.round2_hints)
+                    )
+                )
+            if not self._preview_round2_route(show_fault=True):
+                self.status_text.set("ROUND2 NOT STARTED - route preview could not be built")
+                return
+
         self.mission_started = True
+        self.mission_finished_announced = False
+        self.status_override = None
         self.explorer.running = True
-        self.explorer.set_mission_mode(self.round_var.get())
+        self.explorer.set_mission_mode(requested_mode)
         self.explorer.set_fire_mode(self.fire_var.get())
         self.explorer.set_fire_burst_count(self.burst_var.get())
         self._target_filter_changed()
         self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        try:
+            self.speed_apply_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self.status_text.set(
+            "START requested - {}{}".format(
+                requested_mode,
+                " using previewed shortest route" if requested_mode == "ROUND2" else ""
+            )
+        )
         self.mission_thread = threading.Thread(
             target=self._mission_worker, name="RoboMasterMission", daemon=False
         )
@@ -8179,15 +10096,60 @@ class MissionControlGUI:
             )
             self.explorer.enter_safe_pause("GUI mission exception")
         finally:
+            # cleanup() is also the authoritative STOP+SAVE path: latest map,
+            # target memory and the combined Round-1 snapshot are flushed before
+            # the SDK connection is closed.
             self.explorer.cleanup()
 
-    def _stop_mission(self):
-        self.explorer.running = False
+    def _mission_finished_ui(self):
         try:
-            self.explorer.safe_stop()
+            self.mission_finished_announced = True
+            self.stop_btn.configure(state="disabled")
+            self.start_btn.configure(state="disabled")
+            if self.explorer.mission_mode == "ROUND1":
+                self.memory_status_text.set(
+                    "Saved Round-1 snapshot: {}".format(ROUND1_ATTACK_MEMORY_JSON)
+                )
+            self.status_override = (
+                "MISSION ENDED - robot stopped and autosaved. "
+                "For Round 2 load maps/round1_attack_memory.json, Preview, then START."
+            )
+            self.status_text.set(self.status_override)
         except Exception:
             pass
-        self.status_text.set("STOP requested - robot stopping safely")
+
+    def _stop_mission(self):
+        if not self.mission_started:
+            return
+        # Kill autonomous motion first, then persist the Round-1 bundle immediately.
+        # cleanup() in the worker will save a second time before closing the SDK.
+        self.explorer.running = False
+        self.stop_btn.configure(state="disabled")
+        self.status_override = (
+            "STOP requested - robot stopping; saving map + targets + Round-2 bundle NOW..."
+        )
+        self.status_text.set(self.status_override)
+        try:
+            ok = self.explorer.save_manual_stop_checkpoint(reason="GUI_STOP")
+            if self.explorer.mission_mode == "ROUND1":
+                self.memory_status_text.set(
+                    "STOP snapshot {}: {} | load THIS file for Round 2".format(
+                        "SAVED" if ok else "PARTIAL", ROUND1_ATTACK_MEMORY_JSON
+                    )
+                )
+            self.status_override = (
+                "STOPPED + CHECKPOINT SAVED; cleanup is finishing safely"
+                if ok else
+                "STOPPED; checkpoint was partial - cleanup will retry save"
+            )
+            self.status_text.set(self.status_override)
+        except Exception as exc:
+            self.explorer.fault(
+                "GUI STOP SAVE", "{}: {}".format(type(exc).__name__, exc),
+                "worker cleanup will retry save",
+            )
+            self.status_override = "STOPPED; cleanup will retry automatic save"
+            self.status_text.set(self.status_override)
 
     def _on_close(self):
         self.closing = True
@@ -8207,13 +10169,15 @@ class MissionControlGUI:
             heading = int(self.explorer.heading)
             targets = [dict(t) for t in self.explorer.target_system.targets]
             hints = [dict(h) for h in self.explorer.round2_hints]
-            return visited, edge_state, current, root, heading, targets, hints
+            preview_plan = dict(self.explorer.round2_preview_plan or {})
+            breadcrumbs = self.explorer.breadcrumb_snapshot()
+            return visited, edge_state, current, root, heading, targets, hints, preview_plan, breadcrumbs
         except Exception:
-            return set(), {}, (0, 0), (0, 0), 0, [], []
+            return set(), {}, (0, 0), (0, 0), 0, [], [], {}, []
 
     def _draw_map(self):
         self.canvas.delete("all")
-        visited, edge_state, current, root, heading, targets, hints = self._snapshot_map()
+        visited, edge_state, current, root, heading, targets, hints, preview_plan, breadcrumbs = self._snapshot_map()
         cells = set(visited) | {current, root}
         for (cell, d), state in edge_state.items():
             c = tuple(cell)
@@ -8225,6 +10189,14 @@ class MissionControlGUI:
             c = h.get("cell")
             if isinstance(c, (list, tuple)) and len(c) >= 2:
                 cells.add((int(c[0]), int(c[1])))
+        for c in preview_plan.get("route_cells", []) or []:
+            if isinstance(c, (list, tuple)) and len(c) >= 2:
+                cells.add((int(c[0]), int(c[1])))
+        for b in breadcrumbs:
+            for key in ("from", "to"):
+                c = b.get(key) if isinstance(b, dict) else None
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    cells.add((int(c[0]), int(c[1])))
         if not cells:
             return
 
@@ -8268,6 +10240,54 @@ class MissionControlGUI:
             else:
                 self.canvas.create_line(x1,y1,x2,y2, fill="#999999", width=2, dash=(5,4))
 
+        # Chronological BREADCRUMB trail: orange = where the chassis ACTUALLY
+        # traveled.  Draw it before the purple Round-2 preview so the planned
+        # shortest route remains easy to distinguish.
+        valid_breadcrumbs = []
+        for b in breadcrumbs[-160:]:
+            if not isinstance(b, dict):
+                continue
+            fr = b.get("from"); to = b.get("to")
+            if not (isinstance(fr, (list, tuple)) and len(fr) >= 2 and isinstance(to, (list, tuple)) and len(to) >= 2):
+                continue
+            fr = (int(fr[0]), int(fr[1])); to = (int(to[0]), int(to[1]))
+            valid_breadcrumbs.append((b, fr, to))
+            fx, fy = origin(fr); tx, ty = origin(to)
+            self.canvas.create_line(
+                fx + cell_px/2, fy + cell_px/2,
+                tx + cell_px/2, ty + cell_px/2,
+                fill="#d27b00", width=2, arrow=tk.LAST,
+            )
+        # Number the most recent breadcrumbs only; numbering every revisit makes
+        # a dense maze unreadable.  The complete order stays in JSON.
+        for b, _fr, to in valid_breadcrumbs[-20:]:
+            tx, ty = origin(to)
+            seq = int(b.get("seq", 0) or 0)
+            ox = ((seq % 3) - 1) * 6
+            oy = (((seq // 3) % 3) - 1) * 6
+            px, py = tx + cell_px/2 + ox, ty + cell_px/2 + oy
+            self.canvas.create_oval(px-6, py-6, px+6, py+6, fill="#fff3df", outline="#d27b00")
+            self.canvas.create_text(px, py, text=str(seq), fill="#8a4b00", font=("TkDefaultFont", 7))
+
+        # Previewed Round-2 route (same planner used by execution).
+        preview_route = [tuple(c) for c in (preview_plan.get("route_cells") or []) if len(c) >= 2]
+        if len(preview_route) >= 2:
+            pts = []
+            for c in preview_route:
+                x0, y0 = origin(c)
+                pts.extend((x0 + cell_px/2, y0 + cell_px/2))
+            self.canvas.create_line(
+                *pts, fill="#7a3db8", width=3, dash=(8, 4), arrow=tk.LAST
+            )
+        for idx, c in enumerate(preview_plan.get("anchor_order") or [], start=1):
+            c = tuple(c)
+            x0, y0 = origin(c)
+            ax, ay = x0 + cell_px*0.22, y0 + cell_px*0.22
+            self.canvas.create_oval(
+                ax-9, ay-9, ax+9, ay+9, fill="#ffffff", outline="#7a3db8", width=2
+            )
+            self.canvas.create_text(ax, ay, text=str(idx), fill="#7a3db8")
+
         target_colors = {"RED":"#d62728", "GREEN":"#2ca02c", "BLUE":"#1f77b4", "YELLOW":"#c7a600"}
         for t in targets:
             pos = t.get("estimated_grid_xy")
@@ -8305,6 +10325,11 @@ class MissionControlGUI:
         if self.closing:
             return
         try:
+            if (
+                self.mission_started and self.explorer.cleanup_done
+                and not self.mission_finished_announced
+            ):
+                self._mission_finished_ui()
             self._draw_map()
             tof = self.explorer.latest_tof(fresh=False)
             gp, gy = self.explorer.current_gimbal_relative()
@@ -8315,18 +10340,35 @@ class MissionControlGUI:
             burst_count = self.explorer.get_fire_burst_count()
             fire_event = self.explorer.target_system.last_fire_event
             selected_count = len(self.explorer.get_target_selection())
-            self.status_text.set(
-                "Mode={}  Cell={}  Heading={}\nVisited={}  PoseTrusted={}\n"
+            breadcrumb = self.explorer.breadcrumb_snapshot()
+            speed = self.explorer.speed_snapshot()
+            last_breadcrumb = breadcrumb[-1] if breadcrumb else None
+            if last_breadcrumb:
+                breadcrumb_last_text = "#{} {}->{} {} ({})".format(
+                    last_breadcrumb.get("seq"), tuple(last_breadcrumb.get("from", [])),
+                    tuple(last_breadcrumb.get("to", [])), last_breadcrumb.get("dir"),
+                    last_breadcrumb.get("profile"),
+                )
+            else:
+                breadcrumb_last_text = "none"
+            live_status = (
+                "Mode={}  Cell={}  Heading={}\nVisited={}  Breadcrumb={}  PoseTrusted={}\n"
+                "Breadcrumb last={}\n"
                 "ToF={} mm  Gimbal P/Y={}/{}\n"
+                "Speed actual={:.2f} m/s  cmd={:.2f} m/s  [{}]\n"
                 "Target={}\nFire={} x{}  Selected={}/16\nLast={}".format(
                     self.explorer.mission_mode, current, heading,
-                    len(self.explorer.visited), self.explorer.pose_trusted,
+                    len(self.explorer.visited), len(breadcrumb), self.explorer.pose_trusted,
+                    breadcrumb_last_text,
                     "NA" if tof is None else "{:.0f}".format(tof),
                     "NA" if gp is None else "{:+.1f}".format(gp),
                     "NA" if gy is None else "{:+.1f}".format(gy),
+                    float(speed.get("actual_speed",0.0)), float(speed.get("command_speed",0.0)), speed.get("profile","IDLE"),
                     status, fire_mode, burst_count, selected_count, fire_event,
                 )
             )
+            if self.status_override is None:
+                self.status_text.set(live_status)
             self.geometry_text.set(
                 "Center -> ToF forward      : {:.1f} cm\n"
                 "Center -> muzzle forward   : {:.1f} cm\n"
@@ -8334,6 +10376,7 @@ class MissionControlGUI:
                 "Camera -> muzzle vertical  : {:+.1f} cm\n"
                 "ToF -> muzzle vertical     : {:+.1f} cm\n"
                 "Aim policy                  : CENTER -> physical muzzle LOS\n"
+                "Arena                       : {}x{} start={} guard={}\n"
                 "DFS explore speed           : {:.2f} m/s\n"
                 "DFS known/backtrack speed   : {:.2f} m/s\n"
                 "Round1 target time          : {:.0f} s\n"
@@ -8345,6 +10388,8 @@ class MissionControlGUI:
                     FIRE_MUZZLE_AHEAD_OF_TOF_M*100.0,
                     FIRE_CAMERA_ABOVE_MUZZLE_M*100.0,
                     FIRE_TOF_ABOVE_MUZZLE_M*100.0,
+                    GRID_WIDTH_CELLS, GRID_HEIGHT_CELLS, ROOT_CELL,
+                    "ON" if FIELD_BOUNDARY_GUARD_ENABLED else "OFF",
                     DFS_EXPLORE_SPEED_MPS,
                     DFS_KNOWN_SPEED_MPS,
                     MAX_MISSION_SEC,
@@ -8353,6 +10398,26 @@ class MissionControlGUI:
                     ROUND2_HARD_LIMIT_SEC,
                 )
             )
+            self.speed_live_text.set(
+                "ACTIVE PROFILE : {}\nCOMMAND LABEL  : {}\n\n"
+                "Command Forward X : {:+.3f} m/s\nCommand Strafe Y : {:+.3f} m/s\n"
+                "Command Total     : {:.3f} m/s\nCommand Yaw       : {:+.1f} deg/s\n\n"
+                "Measured Forward  : {:+.3f} m/s\nMeasured Right    : {:+.3f} m/s\n"
+                "Measured Total    : {:.3f} m/s\nOdom World X/Y    : {:+.3f} / {:+.3f} m/s\n\n"
+                "Configured Explore: {:.3f} m/s\nConfigured Known/R2: {:.3f} m/s\n"
+                "Target Shift F/M/S: {:.3f} / {:.3f} / {:.3f} m/s\n"
+                "IR / Sharp side   : {:.3f} / {:.3f} m/s\nTurn max          : {:.1f} deg/s".format(
+                    speed.get("profile","IDLE"), speed.get("command_label","-"),
+                    float(speed.get("command_x",0.0)), float(speed.get("command_y",0.0)),
+                    float(speed.get("command_speed",0.0)), float(speed.get("command_z",0.0)),
+                    float(speed.get("actual_forward",0.0)), float(speed.get("actual_right",0.0)),
+                    float(speed.get("actual_speed",0.0)), float(speed.get("actual_vx",0.0)), float(speed.get("actual_vy",0.0)),
+                    DFS_EXPLORE_SPEED_MPS, DFS_KNOWN_SPEED_MPS, TARGET_SIDE_SHIFT_SPEED_MPS,
+                    TARGET_SIDE_SHIFT_MED_SPEED_MPS, TARGET_SIDE_SHIFT_SLOW_MPS, IR_SIMPLE_STRAFE_SPEED_MPS,
+                    SHARP_SIDE_ESCAPE_SPEED_MPS, TURN_MAX_DPS
+                )
+            )
+
             s = dict(self.explorer.target_system.last_aim_solution)
             if s:
                 self.aim_text.set(
@@ -8423,7 +10488,42 @@ def main():
         "--round", dest="mission_round", choices=(1, 2), type=int, default=1,
         help="1=explore/map/fire and save attack memory, 2=load map + shortest attack",
     )
+    parser.add_argument(
+        "--arena-config", type=str, default=None,
+        help="optional JSON arena profile (width/height/origin/start); overrides built-in profile",
+    )
+    parser.add_argument("--grid-width", type=int, default=None, help="arena width in logical cells")
+    parser.add_argument("--grid-height", type=int, default=None, help="arena height in logical cells")
+    parser.add_argument("--grid-x-min", type=int, default=None, help="minimum logical x coordinate")
+    parser.add_argument("--grid-y-min", type=int, default=None, help="minimum logical y coordinate")
+    parser.add_argument("--start-x", type=int, default=None, help="runtime start-cell x")
+    parser.add_argument("--start-y", type=int, default=None, help="runtime start-cell y")
+    parser.add_argument(
+        "--no-boundary-guard", action="store_true",
+        help="disable configured perimeter rejection (normally leave enabled)",
+    )
     args = parser.parse_args()
+
+    start_override = None
+    if args.start_x is not None or args.start_y is not None:
+        if args.start_x is None or args.start_y is None:
+            parser.error("--start-x and --start-y must be supplied together")
+        start_override = [args.start_x, args.start_y]
+
+    try:
+        load_arena_profile(
+            args.arena_config,
+            overrides={
+                "width_cells": args.grid_width,
+                "height_cells": args.grid_height,
+                "x_min": args.grid_x_min,
+                "y_min": args.grid_y_min,
+                "start_cell": start_override,
+                "boundary_guard": False if args.no_boundary_guard else None,
+            },
+        )
+    except Exception as exc:
+        parser.error("invalid arena profile: {}: {}".format(type(exc).__name__, exc))
 
     explorer = DFSMapOnlyExplorer()
     explorer.set_fire_mode(args.fire)
