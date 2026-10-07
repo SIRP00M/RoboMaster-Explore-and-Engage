@@ -1,0 +1,6 @@
+# Use the versions from your working RoboMaster environment.
+# This dependency list is not a tested competition-machine lockfile.
+robomaster
+numpy
+opencv-python
+# Tkinter is supplied by Python / the operating system, not pip.
